@@ -5,8 +5,8 @@
 [![WF1 Deploy](https://img.shields.io/github/actions/workflow/status/YOUR_ORG/gcp-cis-benchmark/wf1_deploy.yml?label=WF1%20Deploy&style=flat-square)](../../actions/workflows/wf1_deploy.yml)
 [![WF2 Monitor](https://img.shields.io/github/actions/workflow/status/YOUR_ORG/gcp-cis-benchmark/wf2_monitor.yml?label=WF2%20Monitor&style=flat-square)](../../actions/workflows/wf2_monitor.yml)
 
-Hệ thống tự động hóa triển khai và kiểm tra tuân thủ bảo mật GCP
-theo **CIS Google Cloud Platform Foundation Benchmark v4.0.0** — 23 tiêu chuẩn, 5 domain.
+Automated deployment and security compliance checking on GCP
+based on the **CIS Google Cloud Platform Foundation Benchmark v4.0.0** — 23 controls, 5 domains.
 
 ---
 
