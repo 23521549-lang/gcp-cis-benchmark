@@ -1,0 +1,8 @@
+project_id          = ""
+region              = ""
+zone                = ""
+db_username         = ""
+db_password         = ""
+allowed_client_cidr = ""
+storage_bucket_name = ""
+alert_email         = ""

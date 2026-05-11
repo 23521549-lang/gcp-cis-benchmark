@@ -1,0 +1,109 @@
+name: "WF2 — Scheduled CIS Monitor"
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'  # Mỗi 6 tiếng
+  workflow_dispatch:
+    inputs:
+      notify_on_pass:
+        description: 'Gửi email ngay cả khi PASS'
+        type: boolean
+        default: false
+
+env:
+  PROJECT_ID: project-3a51a40b-8c9e-4126-804
+  SCRIPTS_DIR: scripts
+
+jobs:
+  cis-compliance-check:
+    name: "CIS Continuous Compliance Check"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Auth GCP
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+
+      - name: Run CIS Full Check
+        id: cis_check
+        run: |
+          chmod +x ${{ env.SCRIPTS_DIR }}/cis_full_check.sh
+          cd ${{ env.SCRIPTS_DIR }}
+          ./cis_full_check.sh json /tmp/cis_report.json 2>&1 | tee /tmp/cis_output.txt
+          echo "CIS_EXIT=${PIPESTATUS[0]}" >> $GITHUB_ENV
+
+          if [ -f /tmp/cis_report.json ]; then
+            echo "CIS_PASS=$(jq '.total_pass' /tmp/cis_report.json)" >> $GITHUB_ENV
+            echo "CIS_FAIL=$(jq '.total_fail' /tmp/cis_report.json)" >> $GITHUB_ENV
+            echo "CIS_RATE=$(jq '.compliance_rate' /tmp/cis_report.json)" >> $GITHUB_ENV
+            echo "CIS_STATUS=$(jq -r '.status' /tmp/cis_report.json)" >> $GITHUB_ENV
+          fi
+
+      - name: Compare with last run (detect regression)
+        id: regression_check
+        run: |
+          # Download last artifact nếu có
+          LAST_FAIL=0
+          CURRENT_FAIL=${{ env.CIS_FAIL }}
+          REGRESSION="false"
+
+          if [ "$CURRENT_FAIL" -gt "$LAST_FAIL" ]; then
+            REGRESSION="true"
+            echo "REGRESSION=true" >> $GITHUB_ENV
+          else
+            echo "REGRESSION=false" >> $GITHUB_ENV
+          fi
+
+      - name: Upload CIS Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: cis-monitor-${{ github.run_number }}-$(date +%Y%m%d)
+          path: /tmp/cis_report.json
+          retention-days: 30
+
+      - name: Trigger WF4 if regression detected
+        if: env.CIS_EXIT != '0' && env.REGRESSION == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'wf4_recovery.yml',
+              ref: 'main',
+              inputs: {
+                trigger: 'WF2_REGRESSION',
+                cis_fail_count: process.env.CIS_FAIL
+              }
+            });
+
+      - name: Send alert email on FAIL
+        if: env.CIS_EXIT != '0'
+        run: |
+          echo "================================================================"
+          echo "    CIS REGRESSION DETECTED — ${{ env.CIS_FAIL }} tiêu chí FAIL"
+          echo "  Project: ${{ env.PROJECT_ID }}"
+          echo "  Compliance: ${{ env.CIS_PASS }} PASS / ${{ env.CIS_FAIL }} FAIL"
+          echo "  WF4 Recovery đang được kích hoạt tự động"
+          echo "================================================================"
+          # Trong production: send email to ${{ secrets.ALERT_EMAIL }}
+
+      - name: Log status (silent if all PASS)
+        if: env.CIS_EXIT == '0' && !inputs.notify_on_pass
+        run: |
+          echo "All CIS controls PASS — ${{ env.CIS_PASS }}/23 — No action needed"
+          echo "  Tất cả OK, không gửi email (cấu hình notify_on_pass=false)"

@@ -1,0 +1,29 @@
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfvars.json
+.terraform.tfstate.lock.info
+.terraform.lock.hcl
+tfplan
+
+# Nhạy cảm — không commit
+terraform/terraform.tfvars
+*.pem
+*.json
+!package.json
+
+# Ansible
+ansible/*.retry
+ansible/inventory_prod.ini
+
+# Scripts output
+/tmp/
+*.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store

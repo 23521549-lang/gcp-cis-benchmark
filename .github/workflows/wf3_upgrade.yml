@@ -1,0 +1,216 @@
+name: "WF3 — Safe Upgrade"
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'terraform/**'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'terraform/**'
+
+env:
+  PROJECT_ID: project-3a51a40b-8c9e-4126-804
+  TF_DIR: terraform
+  SCRIPTS_DIR: scripts
+
+jobs:
+  detect-affected-domains:
+    name: "Detect affected CIS domains"
+    runs-on: ubuntu-latest
+    outputs:
+      check_iam: ${{ steps.detect.outputs.check_iam }}
+      check_logging: ${{ steps.detect.outputs.check_logging }}
+      check_networking: ${{ steps.detect.outputs.check_networking }}
+      check_vm: ${{ steps.detect.outputs.check_vm }}
+      check_storage: ${{ steps.detect.outputs.check_storage }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Detect changed files
+        id: detect
+        run: |
+          CHANGED=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || echo "terraform/")
+
+          echo "Changed files:"
+          echo "$CHANGED"
+
+          # Map file thay đổi -> domain cần check
+          IAM=false; LOGGING=false; NET=false; VM=false; STORAGE=false
+
+          echo "$CHANGED" | grep -q "security_iam\|security_kms\|security_apikey" && IAM=true
+          echo "$CHANGED" | grep -q "logging\|storage" && LOGGING=true
+          echo "$CHANGED" | grep -q "vpc\|networking" && NET=true
+          echo "$CHANGED" | grep -q "vm\|compute" && VM=true
+          echo "$CHANGED" | grep -q "storage" && STORAGE=true
+
+          # Nếu thay đổi provider/variables -> check tất cả
+          if echo "$CHANGED" | grep -q "provider\|variables\|outputs"; then
+            IAM=true; LOGGING=true; NET=true; VM=true; STORAGE=true
+          fi
+
+          echo "check_iam=$IAM" >> $GITHUB_OUTPUT
+          echo "check_logging=$LOGGING" >> $GITHUB_OUTPUT
+          echo "check_networking=$NET" >> $GITHUB_OUTPUT
+          echo "check_vm=$VM" >> $GITHUB_OUTPUT
+          echo "check_storage=$STORAGE" >> $GITHUB_OUTPUT
+
+          echo "Domains to check: IAM=$IAM LOGGING=$LOGGING NET=$NET VM=$VM STORAGE=$STORAGE"
+
+  terraform-plan:
+    name: "Terraform Plan"
+    runs-on: ubuntu-latest
+    needs: detect-affected-domains
+
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Auth GCP
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~> 1.7"
+
+      - name: Terraform Init
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform init -upgrade
+
+      - name: Terraform Plan
+        working-directory: ${{ env.TF_DIR }}
+        id: plan
+        run: |
+          terraform plan \
+            -var="db_password=${{ secrets.DB_PASSWORD }}" \
+            -out=tfplan \
+            -no-color 2>&1 | tee /tmp/tf_plan.txt
+          echo "PLAN_EXIT=${PIPESTATUS[0]}" >> $GITHUB_ENV
+
+      - name: Comment plan on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('/tmp/tf_plan.txt', 'utf8');
+            const truncated = plan.length > 60000 ? plan.substring(0, 60000) + '\n... (truncated)' : plan;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `## Terraform Plan\n\`\`\`\n${truncated}\n\`\`\``
+            });
+
+  terraform-apply:
+    name: "Terraform Apply"
+    runs-on: ubuntu-latest
+    needs: [detect-affected-domains, terraform-plan]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Auth GCP
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init & Apply
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          terraform init -upgrade
+          terraform apply -auto-approve \
+            -var="db_password=${{ secrets.DB_PASSWORD }}" \
+            2>&1 | tee /tmp/tf_apply.txt
+
+  verify-affected-domains:
+    name: "Verify CIS — affected domains only"
+    runs-on: ubuntu-latest
+    needs: [detect-affected-domains, terraform-apply]
+    if: always() && needs.terraform-apply.result == 'success'
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Auth GCP
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Verify IAM domain
+        if: needs.detect-affected-domains.outputs.check_iam == 'true'
+        run: |
+          chmod +x ${{ env.SCRIPTS_DIR }}/check_iam.sh
+          ${{ env.SCRIPTS_DIR }}/check_iam.sh
+
+      - name: Verify Logging domain
+        if: needs.detect-affected-domains.outputs.check_logging == 'true'
+        run: |
+          chmod +x ${{ env.SCRIPTS_DIR }}/check_logging.sh
+          ${{ env.SCRIPTS_DIR }}/check_logging.sh
+
+      - name: Verify Networking domain
+        if: needs.detect-affected-domains.outputs.check_networking == 'true'
+        run: |
+          chmod +x ${{ env.SCRIPTS_DIR }}/check_networking.sh
+          ${{ env.SCRIPTS_DIR }}/check_networking.sh
+
+      - name: Verify VM domain
+        if: needs.detect-affected-domains.outputs.check_vm == 'true'
+        run: |
+          chmod +x ${{ env.SCRIPTS_DIR }}/check_vm.sh
+          ${{ env.SCRIPTS_DIR }}/check_vm.sh
+
+      - name: Verify Storage domain
+        if: needs.detect-affected-domains.outputs.check_storage == 'true'
+        run: |
+          chmod +x ${{ env.SCRIPTS_DIR }}/check_storage.sh
+          ${{ env.SCRIPTS_DIR }}/check_storage.sh
+
+      - name: Trigger WF4 if verify fails
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'wf4_recovery.yml',
+              ref: 'main',
+              inputs: {
+                trigger: 'WF3_VERIFY_FAIL'
+              }
+            });

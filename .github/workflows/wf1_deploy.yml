@@ -1,0 +1,130 @@
+name: "WF1 — Initial Deploy & Bootstrap"
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "terraform/**"
+      - ".github/workflows/wf1_deploy.yml"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Chỉ plan, không apply"
+        type: boolean
+        default: false
+
+env:
+  PROJECT_ID: project-3a51a40b-8c9e-4126-804
+  TF_DIR: terraform
+  SCRIPTS_DIR: scripts
+
+jobs:
+  terraform-deploy:
+    name: "Deploy Infrastructure"
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Auth GCP
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~> 1.7"
+
+      - name: Terraform Init
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform init -upgrade
+
+      - name: Terraform Validate
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform validate
+
+      - name: Terraform Plan
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          terraform plan \
+            -var="db_username=${{ secrets.DB_USERNAME }}" \
+            -var="db_password=${{ secrets.DB_PASSWORD }}" \
+            -var="allowed_client_cidr=${{ secrets.ALLOWED_CLIENT_CIDR }}" \
+            -out=tfplan
+            -detailed-exitcode 2>&1 | tee /tmp/tf_plan.txt
+          echo "PLAN_EXIT=${PIPESTATUS[0]}" >> $GITHUB_ENV
+
+      - name: Terraform Apply
+        if: ${{ !inputs.dry_run && env.PLAN_EXIT != '0' }}
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          terraform apply -auto-approve tfplan 2>&1 | tee /tmp/tf_apply.txt
+          echo "APPLY_STATUS=$?" >> $GITHUB_ENV
+
+      - name: Wait for resources to stabilize
+        run: sleep 30
+
+      - name: Run CIS Full Check
+        id: cis_check
+        run: |
+          chmod +x ${{ env.SCRIPTS_DIR }}/cis_full_check.sh
+          cd ${{ env.SCRIPTS_DIR }}
+          ./cis_full_check.sh json /tmp/cis_report.json 2>&1 | tee /tmp/cis_output.txt
+          CIS_EXIT=${PIPESTATUS[0]}
+          echo "CIS_EXIT=$CIS_EXIT" >> $GITHUB_ENV
+
+          # Parse JSON report
+          if [ -f /tmp/cis_report.json ]; then
+            TOTAL_PASS=$(jq '.total_pass' /tmp/cis_report.json)
+            TOTAL_FAIL=$(jq '.total_fail' /tmp/cis_report.json)
+            RATE=$(jq '.compliance_rate' /tmp/cis_report.json)
+            echo "CIS_PASS=$TOTAL_PASS" >> $GITHUB_ENV
+            echo "CIS_FAIL=$TOTAL_FAIL" >> $GITHUB_ENV
+            echo "CIS_RATE=$RATE" >> $GITHUB_ENV
+          fi
+
+      - name: Upload CIS Report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cis-report-${{ github.run_number }}
+          path: /tmp/cis_report.json
+
+      - name: Trigger WF4 Recovery if CIS FAIL
+        if: env.CIS_EXIT != '0'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'wf4_recovery.yml',
+              ref: 'main',
+              inputs: {
+                trigger: 'WF1',
+                cis_fail_count: process.env.CIS_FAIL,
+                report_artifact: `cis-report-${context.runNumber}`
+              }
+            });
+
+      - name: Send Deploy Summary Email
+        if: always()
+        run: |
+          STATUS="PASS"
+          [ "${{ env.CIS_EXIT }}" != "0" ] && STATUS="CIS FAIL — WF4 đang xử lý"
+
+          echo "Deploy Summary: $STATUS"
+          echo "Compliance: ${{ env.CIS_PASS }} PASS / ${{ env.CIS_FAIL }} FAIL (${{ env.CIS_RATE }}%)"
+          # Trong production: gửi email qua SendGrid/SES hoặc gcloud pubsub

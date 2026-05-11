@@ -1,0 +1,107 @@
+---
+# ================================================================
+# CIS 4.1 + CIS 4.2 — Thay Default SA sang Custom SA trên VM
+# Cần stop VM -> thay SA -> start VM
+# Dùng gcloud vì Ansible GCP module không hỗ trợ thay SA trực tiếp
+# Idempotent: kiểm tra trước khi stop, chỉ stop nếu cần thay
+# ================================================================
+- name: "CIS 4.1 + 4.2 — Thay Custom Service Account cho VM"
+  hosts: localhost
+  gather_facts: false
+  vars:
+    vm_name: "benchmark-vm-01"
+    vm_zone: "asia-southeast1-a"
+    project_id: "project-3a51a40b-8c9e-4126-804"
+    custom_sa: "app-least-privilege-sa@project-3a51a40b-8c9e-4126-804.iam.gserviceaccount.com"
+    project_number: ""  # sẽ được lấy tự động
+
+  tasks:
+    - name: "Lấy project number"
+      command: >
+        gcloud projects describe {{ project_id }}
+        --format="value(projectNumber)"
+      register: project_number_result
+      changed_when: false
+
+    - name: "Set default SA email"
+      set_fact:
+        default_sa: "{{ project_number_result.stdout }}-compute@developer.gserviceaccount.com"
+        project_number: "{{ project_number_result.stdout }}"
+
+    - name: "Kiểm tra SA hiện tại của VM"
+      command: >
+        gcloud compute instances describe {{ vm_name }}
+        --zone={{ vm_zone }}
+        --project={{ project_id }}
+        --format="value(serviceAccounts[0].email)"
+      register: current_sa
+      changed_when: false
+
+    - name: "Hiển thị SA hiện tại"
+      debug:
+        msg: "SA hiện tại: {{ current_sa.stdout }} | Cần: {{ custom_sa }}"
+
+    - name: "Skip nếu đã dùng Custom SA"
+      meta: end_play
+      when: current_sa.stdout == custom_sa
+
+    - name: "Stop VM trước khi thay SA (CIS 4.1 yêu cầu stop)"
+      command: >
+        gcloud compute instances stop {{ vm_name }}
+        --zone={{ vm_zone }}
+        --project={{ project_id }}
+        --quiet
+      when: current_sa.stdout != custom_sa
+
+    - name: "Chờ VM stop hoàn toàn"
+      command: >
+        gcloud compute instances describe {{ vm_name }}
+        --zone={{ vm_zone }}
+        --project={{ project_id }}
+        --format="value(status)"
+      register: vm_status
+      until: vm_status.stdout == "TERMINATED"
+      retries: 30
+      delay: 10
+
+    - name: "Thay Service Account sang Custom SA"
+      command: >
+        gcloud compute instances set-service-account {{ vm_name }}
+        --zone={{ vm_zone }}
+        --project={{ project_id }}
+        --service-account={{ custom_sa }}
+        --scopes=cloud-platform
+        --quiet
+
+    - name: "Start lại VM sau khi thay SA"
+      command: >
+        gcloud compute instances start {{ vm_name }}
+        --zone={{ vm_zone }}
+        --project={{ project_id }}
+        --quiet
+
+    - name: "Chờ VM running"
+      command: >
+        gcloud compute instances describe {{ vm_name }}
+        --zone={{ vm_zone }}
+        --project={{ project_id }}
+        --format="value(status)"
+      register: vm_running
+      until: vm_running.stdout == "RUNNING"
+      retries: 30
+      delay: 10
+
+    - name: "Xác nhận SA đã thay thành công"
+      command: >
+        gcloud compute instances describe {{ vm_name }}
+        --zone={{ vm_zone }}
+        --project={{ project_id }}
+        --format="value(serviceAccounts[0].email)"
+      register: new_sa
+      changed_when: false
+
+    - name: "Kết quả"
+      debug:
+        msg: >
+          CIS 4.1 + 4.2 — SA đã thay: {{ new_sa.stdout }}
+          {% if new_sa.stdout == custom_sa %}✓ PASS{% else %}✗ FAIL — cần kiểm tra lại{% endif %}
