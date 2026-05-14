@@ -4,7 +4,7 @@
 resource "null_resource" "delete_default_network" {
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
-    command     = "DEFAULT=$(gcloud compute networks list --project=${var.project_id} --filter=name=default --format=value(name) 2>/dev/null); if [ \"$DEFAULT\" = \"default\" ]; then gcloud compute networks delete default --project=${var.project_id} --quiet 2>/dev/null || true; fi"
+    command     = "DEFAULT=$(gcloud compute networks list --project=${var.project_id} --filter=name=default --format='value(name)' 2>/dev/null); if [ \"$DEFAULT\" = \"default\" ]; then gcloud compute networks delete default --project=${var.project_id} --quiet 2>/dev/null || true; fi"
   }
 }
 
