@@ -116,8 +116,7 @@ jobs:
               ref: 'main',
               inputs: {
                 trigger: 'WF1',
-                cis_fail_count: process.env.CIS_FAIL,
-                report_artifact: `cis-report-${context.runNumber}`
+                cis_fail_count: process.env.CIS_FAIL
               }
             });
 
