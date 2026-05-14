@@ -95,7 +95,9 @@ jobs:
         id: plan
         run: |
           terraform plan \
+            -var="db_username=${{ secrets.DB_USERNAME }}" \
             -var="db_password=${{ secrets.DB_PASSWORD }}" \
+            -var="allowed_client_cidr=${{ secrets.ALLOWED_CLIENT_CIDR }}" \
             -out=tfplan \
             -no-color 2>&1 | tee /tmp/tf_plan.txt
           echo "PLAN_EXIT=${PIPESTATUS[0]}" >> $GITHUB_ENV
@@ -145,7 +147,9 @@ jobs:
         run: |
           terraform init -upgrade
           terraform apply -auto-approve \
+            -var="db_username=${{ secrets.DB_USERNAME }}" \
             -var="db_password=${{ secrets.DB_PASSWORD }}" \
+            -var="allowed_client_cidr=${{ secrets.ALLOWED_CLIENT_CIDR }}" \
             2>&1 | tee /tmp/tf_apply.txt
 
   verify-affected-domains:
