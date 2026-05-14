@@ -77,19 +77,19 @@ if not storage_sinks:
     issues.append('NO_STORAGE_SINK: không tìm thấy Log Sink nào đến Storage Bucket')
 else:
     for s in storage_sinks:
-        name = s.get('name', 'unknown')
+        name = s.get('name', 'unknown').split('/')[-1]
         filt = s.get('filter', '').strip()
         if filt:
             issues.append(f'HAS_FILTER: {name} có filter — cần xóa để export toàn bộ log')
         else:
-            print(f'OK: {name} -> {s[\"destination\"]}')
-print('\n'.join(issues))
+            print(f'OK: {name}')
+for i in issues:
+    print(i)
 ")
 
 if echo "$SINK_ISSUES" | grep -q "^OK:"; then
-  CLEAN=$(echo "$SINK_ISSUES" | grep "^OK:")
+  pass "Log Sink hợp lệ — không có filter"
   PROBLEMS=$(echo "$SINK_ISSUES" | grep -v "^OK:" || true)
-  pass "Log Sink hợp lệ: $(echo $CLEAN | head -1)"
   if [ -n "$PROBLEMS" ]; then
     fail "Một số sink có vấn đề:"
     echo "$PROBLEMS" | while read line; do info "$line"; done

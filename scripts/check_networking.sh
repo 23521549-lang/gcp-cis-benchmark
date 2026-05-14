@@ -61,6 +61,9 @@ import json, sys
 zones = json.load(sys.stdin)
 off = []
 for z in zones:
+    visibility = z.get('visibility', 'public')
+    if visibility == 'private':
+        continue
     state = z.get('dnssecConfig', {}).get('state', 'off')
     if state != 'on':
         off.append(z.get('name', 'unknown'))
