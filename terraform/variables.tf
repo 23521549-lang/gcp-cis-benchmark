@@ -42,3 +42,5 @@ variable "alert_email" {
   description = "Email nhận cảnh báo bảo mật"
   default     = "23521549@gm.uit.edu.vn"
 }
+
+# Last updated: 2026-05-14
