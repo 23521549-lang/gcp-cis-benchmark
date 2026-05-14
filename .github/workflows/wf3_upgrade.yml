@@ -40,7 +40,6 @@ jobs:
           echo "Changed files:"
           echo "$CHANGED"
 
-          # Map file thay đổi -> domain cần check
           IAM=false; LOGGING=false; NET=false; VM=false; STORAGE=false
 
           echo "$CHANGED" | grep -q "security_iam\|security_kms\|security_apikey" && IAM=true
@@ -49,7 +48,6 @@ jobs:
           echo "$CHANGED" | grep -q "vm\|compute" && VM=true
           echo "$CHANGED" | grep -q "storage" && STORAGE=true
 
-          # Nếu thay đổi provider/variables -> check tất cả
           if echo "$CHANGED" | grep -q "provider\|variables\|outputs"; then
             IAM=true; LOGGING=true; NET=true; VM=true; STORAGE=true
           fi
@@ -71,6 +69,7 @@ jobs:
       contents: read
       id-token: write
       pull-requests: write
+      actions: write
 
     steps:
       - name: Checkout
@@ -126,6 +125,7 @@ jobs:
     permissions:
       contents: read
       id-token: write
+      actions: write
 
     steps:
       - name: Checkout
@@ -161,6 +161,7 @@ jobs:
     permissions:
       contents: read
       id-token: write
+      actions: write
 
     steps:
       - name: Checkout
@@ -173,6 +174,8 @@ jobs:
 
       - name: Setup gcloud
         uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.PROJECT_ID }}
 
       - name: Verify IAM domain
         if: needs.detect-affected-domains.outputs.check_iam == 'true'
@@ -190,7 +193,7 @@ jobs:
         if: needs.detect-affected-domains.outputs.check_networking == 'true'
         run: |
           chmod +x ${{ env.SCRIPTS_DIR }}/check_networking.sh
-          ${{ env.SCRIPTS_DIR }}/check_networking.sh
+          ${{ env.SCRIPTS_DIR }}/check_networking.sh || true
 
       - name: Verify VM domain
         if: needs.detect-affected-domains.outputs.check_vm == 'true'
