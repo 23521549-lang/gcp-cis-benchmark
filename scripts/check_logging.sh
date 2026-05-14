@@ -79,7 +79,8 @@ else:
     for s in storage_sinks:
         name = s.get('name', 'unknown').split('/')[-1]
         filt = s.get('filter', '').strip()
-        if filt:
+        # GCP trả về '(empty filter)' khi không có filter — coi là không có filter
+        if filt and filt != '(empty filter)':
             issues.append(f'HAS_FILTER: {name} có filter — cần xóa để export toàn bộ log')
         else:
             print(f'OK: {name}')
