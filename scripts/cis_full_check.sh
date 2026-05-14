@@ -54,7 +54,7 @@ run_domain_check() {
 
 echo -e "${CYAN}"
 echo "  ╔══════════════════════════════════════════════════════╗"
-echo "  ║     CIS GCP Foundation Benchmark v4.0.0             ║"
+echo "  ║     CIS GCP Foundation Benchmark v4.0.0              ║"
 echo "  ║     Full Compliance Check — 23 Controls              ║"
 echo -e "  ║     Project: $PROJECT_ID"
 echo "  ╚══════════════════════════════════════════════════════╝"
