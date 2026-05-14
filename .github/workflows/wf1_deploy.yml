@@ -1,11 +1,6 @@
 name: "WF1 — Initial Deploy & Bootstrap"
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - "terraform/**"
-      - ".github/workflows/wf1_deploy.yml"
   workflow_dispatch:
     inputs:
       dry_run:
