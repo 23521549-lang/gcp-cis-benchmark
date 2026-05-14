@@ -3,26 +3,8 @@
 # ================================================================
 resource "null_resource" "delete_default_network" {
   provisioner "local-exec" {
-    command = <<-EOT
-      DEFAULT=$(gcloud compute networks list \
-        --project=${var.project_id} \
-        --filter="name=default" \
-        --format="value(name)" 2>/dev/null)
-      if [ "$DEFAULT" = "default" ]; then
-        echo "Deleting default network..."
-        gcloud compute firewall-rules list \
-          --project=${var.project_id} \
-          --filter="network=default" \
-          --format="value(name)" | \
-          xargs -I {} gcloud compute firewall-rules delete {} \
-          --project=${var.project_id} --quiet 2>/dev/null || true
-        gcloud compute networks delete default \
-          --project=${var.project_id} --quiet 2>/dev/null || true
-        echo "Default network deleted."
-      else
-        echo "Default network does not exist — OK."
-      fi
-    EOT
+    interpreter = ["/bin/bash", "-c"]
+    command     = "DEFAULT=$(gcloud compute networks list --project=${var.project_id} --filter=name=default --format=value(name) 2>/dev/null); if [ \"$DEFAULT\" = \"default\" ]; then gcloud compute networks delete default --project=${var.project_id} --quiet 2>/dev/null || true; fi"
   }
 }
 
