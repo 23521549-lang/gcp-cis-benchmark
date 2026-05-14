@@ -43,5 +43,5 @@ output "kms_crypto_key_id" {
 }
 
 output "dns_zone_name" {
-  value = google_dns_managed_zone.main.name
+  value = google_dns_managed_zone.public.name
 }

@@ -1,7 +1,5 @@
 # ================================================================
 # CIS 3.1 — Default network không tồn tại
-# Xóa default network bằng cách dùng null_resource + local-exec
-# Terraform không quản lý resource này nên dùng gcloud trực tiếp
 # ================================================================
 resource "null_resource" "delete_default_network" {
   provisioner "local-exec" {
@@ -11,27 +9,25 @@ resource "null_resource" "delete_default_network" {
         --filter="name=default" \
         --format="value(name)" 2>/dev/null)
       if [ "$DEFAULT" = "default" ]; then
-        echo "Đang xóa default network..."
-        # Xóa firewall rules trước
+        echo "Deleting default network..."
         gcloud compute firewall-rules list \
           --project=${var.project_id} \
           --filter="network=default" \
           --format="value(name)" | \
           xargs -I {} gcloud compute firewall-rules delete {} \
           --project=${var.project_id} --quiet 2>/dev/null || true
-        # Xóa network
         gcloud compute networks delete default \
           --project=${var.project_id} --quiet 2>/dev/null || true
-        echo "Đã xóa default network."
+        echo "Default network deleted."
       else
-        echo "Default network không tồn tại — OK."
+        echo "Default network does not exist — OK."
       fi
     EOT
   }
 }
 
 # ================================================================
-# Custom VPC — benchmark-vpc (thay thế default)
+# Custom VPC
 # ================================================================
 resource "google_compute_network" "vpc" {
   name                    = "benchmark-vpc"
@@ -41,11 +37,7 @@ resource "google_compute_network" "vpc" {
 }
 
 # ================================================================
-# Subnet — CIS 3.8 — VPC Flow Logs đủ 4 điều kiện:
-#   aggregation_interval = INTERVAL_5_SEC
-#   flow_sampling        = 1.0 (100%)
-#   metadata             = INCLUDE_ALL_METADATA
-#   filter_expr          = không có (logs_filtered = false)
+# CIS 3.8 — VPC Flow Logs
 # ================================================================
 resource "google_compute_subnetwork" "subnet" {
   name          = "benchmark-subnet"
@@ -61,12 +53,14 @@ resource "google_compute_subnetwork" "subnet" {
 }
 
 # ================================================================
-# CIS 3.3 + CIS 2.12 — Cloud DNS Zone với DNSSEC + DNS Logging
+# CIS 2.12 — DNS Logging
+# CIS 3.3 — DNSSEC chỉ áp dụng cho public zone
+#            Private zone không hỗ trợ DNSSEC — tạo public zone riêng
 # ================================================================
-resource "google_dns_managed_zone" "main" {
-  name        = "benchmark-dns-zone"
+resource "google_dns_managed_zone" "private" {
+  name        = "benchmark-private-zone"
   dns_name    = "benchmark.internal."
-  description = "Internal DNS zone với DNSSEC (CIS 3.3)"
+  description = "Private DNS zone for internal resolution"
   visibility  = "private"
 
   private_visibility_config {
@@ -74,15 +68,21 @@ resource "google_dns_managed_zone" "main" {
       network_url = google_compute_network.vpc.self_link
     }
   }
+}
 
-  # CIS 3.3 — DNSSEC bật
+resource "google_dns_managed_zone" "public" {
+  name        = "benchmark-public-zone"
+  dns_name    = "benchmark-cis.com."
+  description = "Public DNS zone with DNSSEC enabled (CIS 3.3)"
+  visibility  = "public"
+
   dnssec_config {
     state         = "on"
     non_existence = "nsec3"
   }
 }
 
-# CIS 2.12 — DNS Logging bật cho VPC network
+# CIS 2.12 — DNS Logging bật cho VPC
 resource "google_dns_policy" "dns_logging" {
   name           = "benchmark-dns-logging-policy"
   enable_logging = true
@@ -93,8 +93,8 @@ resource "google_dns_policy" "dns_logging" {
 }
 
 # ================================================================
-# CIS 3.6 — SSH chỉ từ IP cụ thể, không mở 0.0.0.0/0
-# CIS 3.7 — RDP không mở 0.0.0.0/0 (không có rule nào mở port 3389)
+# CIS 3.6 — SSH chỉ từ IP cụ thể
+# CIS 3.7 — Không có rule nào mở RDP
 # ================================================================
 resource "google_compute_firewall" "allow_ssh" {
   name    = "benchmark-allow-ssh"
@@ -107,11 +107,9 @@ resource "google_compute_firewall" "allow_ssh" {
 
   source_ranges = [var.allowed_client_cidr]
   target_tags   = ["benchmark-vm"]
-
-  description = "CIS 3.6 — SSH chỉ từ IP được phép"
+  description   = "CIS 3.6 — SSH only from allowed IP"
 }
 
-# Deny-all ingress tường minh — production hardening
 resource "google_compute_firewall" "deny_all_ingress" {
   name      = "benchmark-deny-all-ingress"
   network   = google_compute_network.vpc.name
@@ -123,5 +121,5 @@ resource "google_compute_firewall" "deny_all_ingress" {
   }
 
   source_ranges = ["0.0.0.0/0"]
-  description   = "Deny all ingress mặc định — chỉ allow những gì khai báo tường minh"
+  description   = "Deny all ingress by default"
 }

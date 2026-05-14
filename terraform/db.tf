@@ -38,7 +38,6 @@ resource "google_sql_database_instance" "postgres" {
       }
     }
 
-    # Database flags cho PostgreSQL (CIS 6.2)
     database_flags {
       name  = "log_connections"
       value = "on"
@@ -49,15 +48,15 @@ resource "google_sql_database_instance" "postgres" {
     }
     database_flags {
       name  = "log_error_verbosity"
-      value = "DEFAULT"
+      value = "default"
     }
     database_flags {
       name  = "log_min_messages"
-      value = "WARNING"
+      value = "warning"
     }
     database_flags {
       name  = "log_min_error_statement"
-      value = "ERROR"
+      value = "error"
     }
   }
 
