@@ -14,17 +14,20 @@ env:
   PROJECT_ID: project-3a51a40b-8c9e-4126-804
   TF_DIR: terraform
   SCRIPTS_DIR: scripts
+  REGION: asia-southeast1
+  TF_STATE_BUCKET: tf-state-project-3a51a40b-8c9e-4126-804
 
 jobs:
   detect-affected-domains:
     name: "Detect affected CIS domains"
     runs-on: ubuntu-latest
     outputs:
-      check_iam: ${{ steps.detect.outputs.check_iam }}
-      check_logging: ${{ steps.detect.outputs.check_logging }}
+      check_iam:        ${{ steps.detect.outputs.check_iam }}
+      check_logging:    ${{ steps.detect.outputs.check_logging }}
       check_networking: ${{ steps.detect.outputs.check_networking }}
-      check_vm: ${{ steps.detect.outputs.check_vm }}
-      check_storage: ${{ steps.detect.outputs.check_storage }}
+      check_vm:         ${{ steps.detect.outputs.check_vm }}
+      check_storage:    ${{ steps.detect.outputs.check_storage }}
+      check_sql:        ${{ steps.detect.outputs.check_sql }}
 
     steps:
       - name: Checkout
@@ -36,40 +39,39 @@ jobs:
         id: detect
         run: |
           CHANGED=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || echo "terraform/")
+          echo "Changed files: $CHANGED"
 
-          echo "Changed files:"
-          echo "$CHANGED"
-
-          IAM=false; LOGGING=false; NET=false; VM=false; STORAGE=false
+          IAM=false; LOGGING=false; NET=false; VM=false; STORAGE=false; SQL=false
 
           echo "$CHANGED" | grep -q "security_iam\|security_kms\|security_apikey" && IAM=true
-          echo "$CHANGED" | grep -q "logging\|storage" && LOGGING=true
-          echo "$CHANGED" | grep -q "vpc\|networking" && NET=true
-          echo "$CHANGED" | grep -q "vm\|compute" && VM=true
-          echo "$CHANGED" | grep -q "storage" && STORAGE=true
+          echo "$CHANGED" | grep -q "logging"                                       && LOGGING=true
+          echo "$CHANGED" | grep -q "vpc\|networking"                               && NET=true
+          echo "$CHANGED" | grep -q "vm\|compute"                                   && VM=true
+          echo "$CHANGED" | grep -q "storage"                                       && STORAGE=true
+          echo "$CHANGED" | grep -q "db\.tf"                                        && SQL=true
 
+          # provider/variables/outputs ảnh hưởng tất cả
           if echo "$CHANGED" | grep -q "provider\|variables\|outputs"; then
-            IAM=true; LOGGING=true; NET=true; VM=true; STORAGE=true
+            IAM=true; LOGGING=true; NET=true; VM=true; STORAGE=true; SQL=true
           fi
 
-          echo "check_iam=$IAM" >> $GITHUB_OUTPUT
+          echo "check_iam=$IAM"        >> $GITHUB_OUTPUT
           echo "check_logging=$LOGGING" >> $GITHUB_OUTPUT
-          echo "check_networking=$NET" >> $GITHUB_OUTPUT
-          echo "check_vm=$VM" >> $GITHUB_OUTPUT
+          echo "check_networking=$NET"  >> $GITHUB_OUTPUT
+          echo "check_vm=$VM"           >> $GITHUB_OUTPUT
           echo "check_storage=$STORAGE" >> $GITHUB_OUTPUT
+          echo "check_sql=$SQL"         >> $GITHUB_OUTPUT
 
-          echo "Domains to check: IAM=$IAM LOGGING=$LOGGING NET=$NET VM=$VM STORAGE=$STORAGE"
+          echo "Domains: IAM=$IAM LOG=$LOGGING NET=$NET VM=$VM STG=$STORAGE SQL=$SQL"
 
   terraform-plan:
     name: "Terraform Plan"
     runs-on: ubuntu-latest
     needs: detect-affected-domains
-
     permissions:
       contents: read
       id-token: write
       pull-requests: write
-      actions: write
 
     steps:
       - name: Checkout
@@ -91,14 +93,12 @@ jobs:
 
       - name: Terraform Plan
         working-directory: ${{ env.TF_DIR }}
-        id: plan
         run: |
           terraform plan \
             -var="db_username=${{ secrets.DB_USERNAME }}" \
             -var="db_password=${{ secrets.DB_PASSWORD }}" \
             -var="allowed_client_cidr=${{ secrets.ALLOWED_CLIENT_CIDR }}" \
-            -out=tfplan \
-            -no-color 2>&1 | tee /tmp/tf_plan.txt
+            -out=tfplan -no-color 2>&1 | tee /tmp/tf_plan.txt
           echo "PLAN_EXIT=${PIPESTATUS[0]}" >> $GITHUB_ENV
 
       - name: Comment plan on PR
@@ -108,7 +108,9 @@ jobs:
           script: |
             const fs = require('fs');
             const plan = fs.readFileSync('/tmp/tf_plan.txt', 'utf8');
-            const truncated = plan.length > 60000 ? plan.substring(0, 60000) + '\n... (truncated)' : plan;
+            const truncated = plan.length > 60000
+              ? plan.substring(0, 60000) + '\n... (truncated)'
+              : plan;
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -117,47 +119,10 @@ jobs:
             });
 
   terraform-apply:
-    name: "Terraform Apply"
+    name: "Terraform Apply + Verify + Update Baseline"
     runs-on: ubuntu-latest
     needs: [detect-affected-domains, terraform-plan]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-
-    permissions:
-      contents: read
-      id-token: write
-      actions: write
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Auth GCP
-        uses: google-github-actions/auth@v2
-        with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
-
-      - name: Setup gcloud
-        uses: google-github-actions/setup-gcloud@v2
-
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
-
-      - name: Terraform Init & Apply
-        working-directory: ${{ env.TF_DIR }}
-        run: |
-          terraform init -upgrade
-          terraform apply -auto-approve \
-            -var="db_username=${{ secrets.DB_USERNAME }}" \
-            -var="db_password=${{ secrets.DB_PASSWORD }}" \
-            -var="allowed_client_cidr=${{ secrets.ALLOWED_CLIENT_CIDR }}" \
-            2>&1 | tee /tmp/tf_apply.txt
-
-  verify-affected-domains:
-    name: "Verify CIS — affected domains only"
-    runs-on: ubuntu-latest
-    needs: [detect-affected-domains, terraform-apply]
-    if: always() && needs.terraform-apply.result == 'success'
-
     permissions:
       contents: read
       id-token: write
@@ -177,38 +142,98 @@ jobs:
         with:
           project_id: ${{ env.PROJECT_ID }}
 
-      - name: Verify IAM domain
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~> 1.7"
+
+      - name: Terraform Init & Apply
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          terraform init -upgrade
+          terraform apply -auto-approve \
+            -var="db_username=${{ secrets.DB_USERNAME }}" \
+            -var="db_password=${{ secrets.DB_PASSWORD }}" \
+            -var="allowed_client_cidr=${{ secrets.ALLOWED_CLIENT_CIDR }}" \
+            2>&1 | tee /tmp/tf_apply.txt
+          echo "APPLY_EXIT=$?" >> $GITHUB_ENV
+
+      - name: Wait for propagation
+        run: sleep 30
+
+      # ── Verify domain bị ảnh hưởng ─────────────────────────────
+      - name: "[Verify] IAM domain"
         if: needs.detect-affected-domains.outputs.check_iam == 'true'
         run: |
           chmod +x ${{ env.SCRIPTS_DIR }}/check_iam.sh
-          ${{ env.SCRIPTS_DIR }}/check_iam.sh
+          ${{ env.SCRIPTS_DIR }}/check_iam.sh 2>&1 | tee /tmp/verify_iam.txt
+          echo "IAM_VERIFY_EXIT=${PIPESTATUS[0]}" >> $GITHUB_ENV
 
-      - name: Verify Logging domain
+      - name: "[Verify] Logging domain"
         if: needs.detect-affected-domains.outputs.check_logging == 'true'
         run: |
           chmod +x ${{ env.SCRIPTS_DIR }}/check_logging.sh
-          ${{ env.SCRIPTS_DIR }}/check_logging.sh
+          ${{ env.SCRIPTS_DIR }}/check_logging.sh 2>&1 | tee /tmp/verify_logging.txt
 
-      - name: Verify Networking domain
+      - name: "[Verify] Networking domain"
         if: needs.detect-affected-domains.outputs.check_networking == 'true'
         run: |
           chmod +x ${{ env.SCRIPTS_DIR }}/check_networking.sh
-          ${{ env.SCRIPTS_DIR }}/check_networking.sh || true
+          ${{ env.SCRIPTS_DIR }}/check_networking.sh 2>&1 | tee /tmp/verify_net.txt
 
-      - name: Verify VM domain
+      - name: "[Verify] VM domain"
         if: needs.detect-affected-domains.outputs.check_vm == 'true'
         run: |
           chmod +x ${{ env.SCRIPTS_DIR }}/check_vm.sh
-          ${{ env.SCRIPTS_DIR }}/check_vm.sh
+          ${{ env.SCRIPTS_DIR }}/check_vm.sh 2>&1 | tee /tmp/verify_vm.txt
 
-      - name: Verify Storage domain
+      - name: "[Verify] Storage domain"
         if: needs.detect-affected-domains.outputs.check_storage == 'true'
         run: |
           chmod +x ${{ env.SCRIPTS_DIR }}/check_storage.sh
-          ${{ env.SCRIPTS_DIR }}/check_storage.sh
+          ${{ env.SCRIPTS_DIR }}/check_storage.sh 2>&1 | tee /tmp/verify_storage.txt
 
-      - name: Trigger WF4 if verify fails
-        if: failure()
+      - name: "[Verify] Cloud SQL domain"
+        if: needs.detect-affected-domains.outputs.check_sql == 'true'
+        run: |
+          chmod +x ${{ env.SCRIPTS_DIR }}/check_sql.sh
+          ${{ env.SCRIPTS_DIR }}/check_sql.sh 2>&1 | tee /tmp/verify_sql.txt
+          SQL_EXIT=${PIPESTATUS[0]}
+          echo "SQL_VERIFY_EXIT=$SQL_EXIT" >> $GITHUB_ENV
+
+      # ── Kiểm tra tổng hợp verify ───────────────────────────────
+      - name: Tổng hợp kết quả verify
+        run: |
+          VERIFY_FAIL=0
+          for f in /tmp/verify_*.txt; do
+            [ -f "$f" ] && grep -c "\[FAIL\]" "$f" 2>/dev/null && VERIFY_FAIL=$((VERIFY_FAIL+1)) || true
+          done
+          echo "VERIFY_FAIL=$VERIFY_FAIL" >> $GITHUB_ENV
+          if [ "$VERIFY_FAIL" -eq 0 ]; then
+            echo "✓ Tất cả domain verify PASS"
+          else
+            echo "⚠ Có $VERIFY_FAIL FAIL sau upgrade"
+          fi
+
+      # ── Phase 1: Cập nhật baseline nếu verify PASS ─────────────
+      - name: "[Phase 1] Cập nhật baseline sau upgrade thành công"
+        if: env.VERIFY_FAIL == '0'
+        env:
+          TF_STATE_BUCKET: ${{ env.TF_STATE_BUCKET }}
+        run: |
+          # Chạy full check để tạo report cập nhật
+          chmod +x ${{ env.SCRIPTS_DIR }}/cis_full_check.sh
+          cd ${{ env.SCRIPTS_DIR }}
+          ./cis_full_check.sh json /tmp/cis_report_wf3.json 2>&1
+          cd ..
+          # Cập nhật baseline
+          chmod +x ${{ env.SCRIPTS_DIR }}/baseline/init_baseline.sh
+          ${{ env.SCRIPTS_DIR }}/baseline/init_baseline.sh \
+            /tmp/cis_report_wf3.json WF3 /tmp/context_info.json || true
+          echo "✓ Baseline cập nhật sau WF3 upgrade"
+
+      - name: Trigger WF4 nếu verify FAIL
+        if: env.VERIFY_FAIL != '0'
         uses: actions/github-script@v7
         with:
           script: |
@@ -218,6 +243,7 @@ jobs:
               workflow_id: 'wf4_recovery.yml',
               ref: 'main',
               inputs: {
-                trigger: 'WF3_VERIFY_FAIL'
+                trigger: 'WF3_VERIFY_FAIL',
+                cis_fail_count: process.env.VERIFY_FAIL
               }
             });

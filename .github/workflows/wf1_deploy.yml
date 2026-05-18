@@ -12,18 +12,18 @@ env:
   PROJECT_ID: project-3a51a40b-8c9e-4126-804
   TF_DIR: terraform
   SCRIPTS_DIR: scripts
+  REGION: asia-southeast1
+  TF_STATE_BUCKET: tf-state-project-3a51a40b-8c9e-4126-804
 
 jobs:
-  terraform-deploy:
+  deploy:
     name: "Deploy Infrastructure"
     runs-on: ubuntu-latest
     timeout-minutes: 60
-
     permissions:
       contents: read
       id-token: write
       actions: write
-
 
     steps:
       - name: Checkout
@@ -38,6 +38,15 @@ jobs:
         uses: google-github-actions/setup-gcloud@v2
         with:
           project_id: ${{ env.PROJECT_ID }}
+
+      # ── Phase 0: Thu thập thông tin trước deploy ────────────────
+      - name: "[Phase 0] Thu thập thông tin hệ thống"
+        run: |
+          chmod +x ${{ env.SCRIPTS_DIR }}/collect_info.sh
+          REGION=${{ env.REGION }} \
+            ${{ env.SCRIPTS_DIR }}/collect_info.sh /tmp
+          echo "Context thu thập xong:"
+          cat /tmp/context_info.json
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
@@ -59,12 +68,12 @@ jobs:
             -var="db_username=${{ secrets.DB_USERNAME }}" \
             -var="db_password=${{ secrets.DB_PASSWORD }}" \
             -var="allowed_client_cidr=${{ secrets.ALLOWED_CLIENT_CIDR }}" \
-            -out=tfplan
+            -out=tfplan \
             -detailed-exitcode 2>&1 | tee /tmp/tf_plan.txt
           echo "PLAN_EXIT=${PIPESTATUS[0]}" >> $GITHUB_ENV
 
       - name: Terraform Apply
-        if: ${{ !inputs.dry_run && env.PLAN_EXIT != '0' }}
+        if: ${{ !inputs.dry_run }}
         working-directory: ${{ env.TF_DIR }}
         run: |
           terraform apply -auto-approve tfplan 2>&1 | tee /tmp/tf_apply.txt
@@ -73,34 +82,44 @@ jobs:
       - name: Wait for resources to stabilize
         run: sleep 30
 
-      - name: Run CIS Full Check
+      # ── CIS Full Check ──────────────────────────────────────────
+      - name: Run CIS Full Check (29 controls)
         id: cis_check
         run: |
           chmod +x ${{ env.SCRIPTS_DIR }}/cis_full_check.sh
           cd ${{ env.SCRIPTS_DIR }}
-          ./cis_full_check.sh json /tmp/cis_report.json 2>&1 | tee /tmp/cis_output.txt
+          ./cis_full_check.sh json /tmp/cis_report.json /tmp/cis_baseline_latest.json \
+            2>&1 | tee /tmp/cis_output.txt
           CIS_EXIT=${PIPESTATUS[0]}
           echo "CIS_EXIT=$CIS_EXIT" >> $GITHUB_ENV
-
-          # Parse JSON report
           if [ -f /tmp/cis_report.json ]; then
-            TOTAL_PASS=$(jq '.total_pass' /tmp/cis_report.json)
-            TOTAL_FAIL=$(jq '.total_fail' /tmp/cis_report.json)
-            RATE=$(jq '.compliance_rate' /tmp/cis_report.json)
-            echo "CIS_PASS=$TOTAL_PASS" >> $GITHUB_ENV
-            echo "CIS_FAIL=$TOTAL_FAIL" >> $GITHUB_ENV
-            echo "CIS_RATE=$RATE" >> $GITHUB_ENV
+            echo "CIS_PASS=$(jq '.total_pass'       /tmp/cis_report.json)" >> $GITHUB_ENV
+            echo "CIS_FAIL=$(jq '.total_fail'       /tmp/cis_report.json)" >> $GITHUB_ENV
+            echo "CIS_RATE=$(jq '.compliance_rate'  /tmp/cis_report.json)" >> $GITHUB_ENV
           fi
+
+      # ── Phase 1: Lưu golden baseline nếu 100% PASS ─────────────
+      - name: "[Phase 1] Lưu golden baseline"
+        if: env.CIS_EXIT == '0' && !inputs.dry_run
+        env:
+          TF_STATE_BUCKET: ${{ env.TF_STATE_BUCKET }}
+        run: |
+          chmod +x ${{ env.SCRIPTS_DIR }}/baseline/init_baseline.sh
+          ${{ env.SCRIPTS_DIR }}/baseline/init_baseline.sh \
+            /tmp/cis_report.json WF1 /tmp/context_info.json
 
       - name: Upload CIS Report
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: cis-report-${{ github.run_number }}
-          path: /tmp/cis_report.json
+          name: cis-deploy-report-${{ github.run_number }}
+          path: |
+            /tmp/cis_report.json
+            /tmp/context_info.json
+          retention-days: 30
 
       - name: Trigger WF4 Recovery if CIS FAIL
-        if: env.CIS_EXIT != '0'
+        if: env.CIS_EXIT != '0' && !inputs.dry_run
         uses: actions/github-script@v7
         with:
           script: |
@@ -115,12 +134,14 @@ jobs:
               }
             });
 
-      - name: Send Deploy Summary Email
+      - name: Summary
         if: always()
         run: |
+          echo "================================================"
+          echo "  WF1 Deploy Summary"
+          echo "  Compliance: ${{ env.CIS_PASS }} PASS / ${{ env.CIS_FAIL }} FAIL"
+          echo "  Rate: ${{ env.CIS_RATE }}%"
           STATUS="PASS"
           [ "${{ env.CIS_EXIT }}" != "0" ] && STATUS="CIS FAIL — WF4 đang xử lý"
-
-          echo "Deploy Summary: $STATUS"
-          echo "Compliance: ${{ env.CIS_PASS }} PASS / ${{ env.CIS_FAIL }} FAIL (${{ env.CIS_RATE }}%)"
-          # Trong production: gửi email qua SendGrid/SES hoặc gcloud pubsub
+          echo "  Status: $STATUS"
+          echo "================================================"

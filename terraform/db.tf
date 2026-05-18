@@ -1,3 +1,8 @@
+# ================================================================
+# Cloud SQL PostgreSQL — CIS v4.0.0 compliant
+# Domain 6: 6.4, 6.2.1, 6.2.2, 6.2.3, 6.2.4, 6.2.8
+# ================================================================
+
 resource "google_project_service" "sqladmin" {
   service            = "sqladmin.googleapis.com"
   disable_on_destroy = false
@@ -32,28 +37,52 @@ resource "google_sql_database_instance" "postgres" {
 
     ip_configuration {
       ipv4_enabled = true
+
       authorized_networks {
         name  = "allowed-client"
         value = var.allowed_client_cidr
       }
+
+      # CIS 6.4 — SSL bắt buộc cho mọi connection
+      require_ssl = true
     }
 
-    database_flags {
-      name  = "log_connections"
-      value = "on"
-    }
-    database_flags {
-      name  = "log_disconnections"
-      value = "on"
-    }
+    # CIS 6.2.1 — log_error_verbosity không được 'verbose'
     database_flags {
       name  = "log_error_verbosity"
       value = "default"
     }
+
+    # CIS 6.2.2 — ghi log mỗi connection mới
+    database_flags {
+      name  = "log_connections"
+      value = "on"
+    }
+
+    # CIS 6.2.3 — ghi log khi session kết thúc
+    database_flags {
+      name  = "log_disconnections"
+      value = "on"
+    }
+
+    # CIS 6.2.4 — ghi log DDL statements
+    database_flags {
+      name  = "log_statement"
+      value = "ddl"
+    }
+
+    # CIS 6.2.8 — pgAudit centralized logging
+    database_flags {
+      name  = "cloudsql.enable_pgaudit"
+      value = "on"
+    }
+
+    # Giữ nguyên các flags hiện có
     database_flags {
       name  = "log_min_messages"
       value = "warning"
     }
+
     database_flags {
       name  = "log_min_error_statement"
       value = "error"

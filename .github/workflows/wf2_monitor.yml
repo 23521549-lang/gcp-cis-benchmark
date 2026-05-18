@@ -2,7 +2,7 @@ name: "WF2 — Scheduled CIS Monitor"
 
 on:
   schedule:
-    - cron: '0 */6 * * *'  # Mỗi 6 tiếng
+    - cron: '0 */6 * * *'
   workflow_dispatch:
     inputs:
       notify_on_pass:
@@ -11,18 +11,21 @@ on:
         default: false
 
 env:
-  PROJECT_ID: project-3a51a40b-8c9e-4126-804
-  SCRIPTS_DIR: scripts
+  PROJECT_ID:      project-3a51a40b-8c9e-4126-804
+  SCRIPTS_DIR:     scripts
+  REGION:          asia-southeast1
+  TF_DIR:          terraform
+  TF_STATE_BUCKET: tf-state-project-3a51a40b-8c9e-4126-804
 
 jobs:
-  cis-compliance-check:
+  monitor:
     name: "CIS Continuous Compliance Check"
     runs-on: ubuntu-latest
     timeout-minutes: 30
-
     permissions:
       contents: read
       id-token: write
+      actions: write
 
     steps:
       - name: Checkout
@@ -38,72 +41,159 @@ jobs:
         with:
           project_id: ${{ env.PROJECT_ID }}
 
-      - name: Run CIS Full Check
-        id: cis_check
+      - name: "[Phase 0] Thu thập thông tin hiện tại"
+        run: |
+          chmod +x ${{ env.SCRIPTS_DIR }}/collect_info.sh
+          REGION=${{ env.REGION }} \
+            ${{ env.SCRIPTS_DIR }}/collect_info.sh /tmp
+
+      - name: Tải baseline từ GCS
+        run: |
+          gsutil cp \
+            gs://${{ env.TF_STATE_BUCKET }}/baseline/cis_baseline_latest.json \
+            /tmp/cis_baseline_latest.json 2>/dev/null \
+            && echo "BASELINE_LOADED=true"  >> $GITHUB_ENV \
+            || echo "BASELINE_LOADED=false" >> $GITHUB_ENV
+
+          gsutil cp \
+            gs://${{ env.TF_STATE_BUCKET }}/baseline/iam_baseline_latest.json \
+            /tmp/iam_baseline_latest.json 2>/dev/null || true
+
+      - name: "[Phase 2a] CIS compliance check (29 controls)"
         run: |
           chmod +x ${{ env.SCRIPTS_DIR }}/cis_full_check.sh
           cd ${{ env.SCRIPTS_DIR }}
-          ./cis_full_check.sh json /tmp/cis_report.json 2>&1 | tee /tmp/cis_output.txt
-          echo "CIS_EXIT=${PIPESTATUS[0]}" >> $GITHUB_ENV
+          ./cis_full_check.sh json /tmp/cis_report.json /tmp/cis_baseline_latest.json \
+            2>&1 | tee /tmp/cis_output.txt
+          CIS_EXIT="${PIPESTATUS[0]}"
+          echo "CIS_EXIT=$CIS_EXIT" >> $GITHUB_ENV
 
           if [ -f /tmp/cis_report.json ]; then
-            echo "CIS_PASS=$(jq '.total_pass' /tmp/cis_report.json)" >> $GITHUB_ENV
-            echo "CIS_FAIL=$(jq '.total_fail' /tmp/cis_report.json)" >> $GITHUB_ENV
+            echo "CIS_PASS=$(jq '.total_pass'      /tmp/cis_report.json)" >> $GITHUB_ENV
+            echo "CIS_FAIL=$(jq '.total_fail'      /tmp/cis_report.json)" >> $GITHUB_ENV
             echo "CIS_RATE=$(jq '.compliance_rate' /tmp/cis_report.json)" >> $GITHUB_ENV
-            echo "CIS_STATUS=$(jq -r '.status' /tmp/cis_report.json)" >> $GITHUB_ENV
+            REGRESSION_COUNT=$(jq '.regression_controls | length' /tmp/cis_report.json)
+            if [ "$REGRESSION_COUNT" -gt 0 ]; then
+              echo "REGRESSION=true"  >> $GITHUB_ENV
+            else
+              echo "REGRESSION=false" >> $GITHUB_ENV
+            fi
           fi
 
-      - name: Compare with last run (detect regression)
-        id: regression_check
-        run: |
-          # Download last artifact nếu có
-          LAST_FAIL=0
-          CURRENT_FAIL=${{ env.CIS_FAIL }}
-          REGRESSION="false"
-
-          if [ "$CURRENT_FAIL" -gt "$LAST_FAIL" ]; then
-            REGRESSION="true"
-            echo "REGRESSION=true" >> $GITHUB_ENV
-          else
-            echo "REGRESSION=false" >> $GITHUB_ENV
-          fi
-
-      - name: Upload CIS Report
-        uses: actions/upload-artifact@v4
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
         with:
-          name: cis-monitor-${{ github.run_number }}-$(date +%Y%m%d)
-          path: /tmp/cis_report.json
+          terraform_version: "~> 1.7"
+
+      - name: "[Phase 2b] Terraform drift detection"
+        run: |
+          cd ${{ env.TF_DIR }}
+          terraform init -upgrade -input=false -no-color 2>/dev/null
+
+          set +e
+          terraform plan \
+            -var="db_username=${{ secrets.DB_USERNAME }}" \
+            -var="db_password=${{ secrets.DB_PASSWORD }}" \
+            -var="allowed_client_cidr=${{ secrets.ALLOWED_CLIENT_CIDR }}" \
+            -detailed-exitcode -input=false -no-color \
+            2>&1 | tee /tmp/drift_check.txt
+          DRIFT_EXIT=$?
+          set -e
+
+          if [ "$DRIFT_EXIT" -eq 2 ]; then
+            echo "DRIFT_DETECTED=true" >> $GITHUB_ENV
+            echo "⚠ DRIFT DETECTED — có thay đổi ngoài Terraform"
+            grep "^  [+~-]" /tmp/drift_check.txt | head -20 || true
+          else
+            echo "DRIFT_DETECTED=false" >> $GITHUB_ENV
+            echo "✓ No drift"
+          fi
+        continue-on-error: true
+
+      - name: "[Phase 2c] IAM anomaly detection"
+        run: |
+          python3 ${{ env.SCRIPTS_DIR }}/python/iam_diff.py \
+            && echo "IAM_ANOMALY=false" >> $GITHUB_ENV \
+            || echo "IAM_ANOMALY=true"  >> $GITHUB_ENV
+        env:
+          IAM_BASELINE: /tmp/iam_baseline_latest.json
+          IAM_CURRENT:  /tmp/iam_snapshot.json
+
+      - name: "Phân loại kết quả"
+        run: |
+          echo "============================================"
+          echo "  COMPLIANCE : ${{ env.CIS_RATE }}%"
+          echo "  FAIL       : ${{ env.CIS_FAIL }}"
+          echo "  REGRESSION : ${{ env.REGRESSION }}"
+          echo "  DRIFT      : ${{ env.DRIFT_DETECTED }}"
+          echo "  IAM ANOMALY: ${{ env.IAM_ANOMALY }}"
+          echo "============================================"
+
+          ACTION="NONE"
+          if [ "${{ env.DRIFT_DETECTED }}" = "true" ] || \
+             [ "${{ env.IAM_ANOMALY }}"    = "true" ]; then
+            ACTION="URGENT"
+          elif [ "${{ env.REGRESSION }}" = "true" ] && \
+               [ "${{ env.CIS_EXIT }}"   != "0" ]; then
+            ACTION="RECOVERY"
+          fi
+
+          echo "ACTION=$ACTION" >> $GITHUB_ENV
+          echo "  ACTION     : $ACTION"
+
+      - name: Lưu compliance history lên GCS
+        run: |
+          TIMESTAMP=$(date -u +%Y%m%d_%H%M%S)
+          TIMESTAMP=$TIMESTAMP \
+          TRIGGER=WF2_scheduled \
+          DRIFT_DETECTED=${{ env.DRIFT_DETECTED }} \
+          IAM_ANOMALY=${{ env.IAM_ANOMALY }} \
+            python3 ${{ env.SCRIPTS_DIR }}/python/save_history.py
+
+          gsutil cp /tmp/history_${TIMESTAMP}.json \
+            gs://${{ env.TF_STATE_BUCKET }}/compliance_history/${TIMESTAMP}.json \
+            2>/dev/null || echo "[WARN] GCS upload failed"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cis-monitor-${{ github.run_number }}
+          path: |
+            /tmp/cis_report.json
+            /tmp/context_info.json
+            /tmp/drift_check.txt
           retention-days: 30
 
-      - name: Trigger WF4 if regression detected
-        if: env.CIS_EXIT != '0' && env.REGRESSION == 'true'
+      - name: Trigger WF4 Recovery
+        if: env.ACTION != 'NONE'
         uses: actions/github-script@v7
         with:
           script: |
+            const action  = process.env.ACTION;
+            const cisFail = process.env.CIS_FAIL || '0';
+            const suffix  = action === 'URGENT' ? 'URGENT' : 'REGRESSION';
             await github.rest.actions.createWorkflowDispatch({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
+              owner:       context.repo.owner,
+              repo:        context.repo.repo,
               workflow_id: 'wf4_recovery.yml',
-              ref: 'main',
+              ref:         'main',
               inputs: {
-                trigger: 'WF2_REGRESSION',
-                cis_fail_count: process.env.CIS_FAIL
+                trigger:        `WF2_${suffix}`,
+                cis_fail_count: cisFail,
               }
             });
+            console.log(`WF4 triggered — ${suffix}`);
 
-      - name: Send alert email on FAIL
-        if: env.CIS_EXIT != '0'
+      - name: Summary
+        if: always()
         run: |
-          echo "================================================================"
-          echo "    CIS REGRESSION DETECTED — ${{ env.CIS_FAIL }} tiêu chí FAIL"
-          echo "  Project: ${{ env.PROJECT_ID }}"
-          echo "  Compliance: ${{ env.CIS_PASS }} PASS / ${{ env.CIS_FAIL }} FAIL"
-          echo "  WF4 Recovery đang được kích hoạt tự động"
-          echo "================================================================"
-          # Trong production: send email to ${{ secrets.ALERT_EMAIL }}
-
-      - name: Log status (silent if all PASS)
-        if: env.CIS_EXIT == '0' && !inputs.notify_on_pass
-        run: |
-          echo "All CIS controls PASS — ${{ env.CIS_PASS }}/23 — No action needed"
-          echo "  Tất cả OK, không gửi email (cấu hình notify_on_pass=false)"
+          echo "============================================"
+          echo "  WF2 Monitor Summary"
+          echo "  Rate   : ${{ env.CIS_RATE }}%"
+          echo "  PASS   : ${{ env.CIS_PASS }}"
+          echo "  FAIL   : ${{ env.CIS_FAIL }}"
+          echo "  Drift  : ${{ env.DRIFT_DETECTED }}"
+          echo "  IAM    : ${{ env.IAM_ANOMALY }}"
+          echo "  Action : ${{ env.ACTION }}"
+          echo "============================================"
