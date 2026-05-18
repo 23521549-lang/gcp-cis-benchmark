@@ -7,6 +7,9 @@ resource "google_kms_key_ring" "my_keyring" {
   name       = "benchmark-keyring"
   location   = var.region
   depends_on = [google_project_service.kms_api]
+  lifecycle {
+    prevent_destroy = true # keyring không xóa được
+  }
 }
 
 # ================================================================
@@ -20,6 +23,7 @@ resource "google_kms_crypto_key" "my_crypto_key" {
 
   lifecycle {
     prevent_destroy = false
+    ignore_changes  = [key_ring]
   }
 }
 
