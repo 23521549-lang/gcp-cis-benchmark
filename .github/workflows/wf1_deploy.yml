@@ -61,6 +61,55 @@ jobs:
         working-directory: ${{ env.TF_DIR }}
         run: terraform validate
 
+      # ── Auto-unlock state lock nếu bị stuck ─────────────────────
+      - name: "Auto-unlock Terraform state nếu bị stuck"
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          LOCK_FILE="gs://${{ env.TF_STATE_BUCKET }}/terraform/state/default.tflock"
+
+          LOCK_EXISTS=$(gsutil stat "$LOCK_FILE" 2>/dev/null && echo "true" || echo "false")
+
+          if [ "$LOCK_EXISTS" = "false" ]; then
+            echo "✓ Không có state lock — tiếp tục"
+            exit 0
+          fi
+
+          LOCK_INFO=$(gsutil cat "$LOCK_FILE" 2>/dev/null || echo "{}")
+
+          LOCK_CREATED=$(python3 - "$LOCK_INFO" <<'PY'
+          import json, sys
+
+          try:
+              d = json.loads(sys.argv[1])
+              print(d.get('Created', ''))
+          except:
+              print('')
+          PY
+          )
+
+          echo "⚠ Phát hiện state lock:"
+          echo "  Created: $LOCK_CREATED"
+
+          AGE_MINUTES=999
+          if [ -n "$LOCK_CREATED" ]; then
+            LOCK_TS=$(date -d "$LOCK_CREATED" +%s 2>/dev/null || echo "0")
+            NOW_TS=$(date +%s)
+            if [ "$LOCK_TS" -gt 0 ]; then
+              AGE_MINUTES=$(( (NOW_TS - LOCK_TS) / 60 ))
+            fi
+            echo "  Lock age: ${AGE_MINUTES} phút"
+          fi
+
+          if [ "$AGE_MINUTES" -gt 15 ]; then
+            echo "  Lock quá ${AGE_MINUTES} phút — xóa tự động (stuck lock)..."
+            gsutil rm "$LOCK_FILE" 2>/dev/null \
+              && echo "  [OK] State lock đã xóa" \
+              || echo "  [WARN] Không xóa được lock"
+          else
+            echo "  Lock mới ${AGE_MINUTES} phút — chờ với -lock-timeout=120s"
+          fi
+        continue-on-error: true
+
       - name: Terraform Plan
         working-directory: ${{ env.TF_DIR }}
         run: |
@@ -69,14 +118,24 @@ jobs:
             -var="db_username=${{ secrets.DB_USERNAME }}" \
             -var="db_password=${{ secrets.DB_PASSWORD }}" \
             -var="allowed_client_cidr=${{ secrets.ALLOWED_CLIENT_CIDR }}" \
+            -lock-timeout=120s \
             -out=tfplan -no-color \
             2>&1 | tee /tmp/tf_plan.txt
           PLAN_EXIT=$?
           set -e
           echo "PLAN_EXIT=$PLAN_EXIT" >> $GITHUB_ENV
+          if [ $PLAN_EXIT -ne 0 ]; then
+            echo "TF_PLAN_FAILED=true" >> $GITHUB_ENV
+            echo "⚠ Terraform Plan FAILED"
+            tail -20 /tmp/tf_plan.txt
+          else
+            echo "TF_PLAN_FAILED=false" >> $GITHUB_ENV
+            echo "✓ Terraform Plan OK"
+          fi
 
+      # ── Auto-import existing resources ───────────────────────────
       - name: "Auto-import existing resources vào Terraform state"
-        if: ${{ !inputs.dry_run }}
+        if: ${{ !inputs.dry_run && env.TF_PLAN_FAILED == 'false' }}
         working-directory: ${{ env.TF_DIR }}
         run: |
           echo "================================================================"
@@ -115,7 +174,7 @@ jobs:
             "projects/${PROJECT}/locations/${REGION}/keyRings/benchmark-keyring/cryptoKeys/benchmark-crypto-key" \
             "KMS Crypto Key: benchmark-crypto-key"
 
-          # Storage bucket — thử các tên phổ biến
+          # Storage bucket
           for BNAME in \
             "benchmark-storage-v2-${PROJECT}" \
             "benchmark-storage-${PROJECT}" \
@@ -174,12 +233,14 @@ jobs:
         continue-on-error: true
 
       - name: Terraform Apply
-        if: ${{ !inputs.dry_run }}
+        if: ${{ !inputs.dry_run && env.TF_PLAN_FAILED == 'false' }}
         working-directory: ${{ env.TF_DIR }}
         run: |
           set +e
-          terraform apply -auto-approve tfplan 2>&1 | tee /tmp/tf_apply.txt
-          APPLY_EXIT=${PIPESTATUS[0]}
+          terraform apply -auto-approve \
+            -lock-timeout=120s \
+            tfplan 2>&1 | tee /tmp/tf_apply.txt
+          APPLY_EXIT=$?
           set -e
 
           echo "APPLY_EXIT=$APPLY_EXIT" >> $GITHUB_ENV
@@ -187,11 +248,11 @@ jobs:
           if [ "$APPLY_EXIT" -ne 0 ]; then
             echo "TF_FAILED=true" >> $GITHUB_ENV
             ERROR_TYPE="TF_UNKNOWN"
-            grep -qiE "already exists|conflict|409"              /tmp/tf_apply.txt && ERROR_TYPE="TF_CONFLICT"
-            grep -qiE "serviceAccountUser|PERMISSION_DENIED|403" /tmp/tf_apply.txt \
+            grep -qiE "already exists|conflict|409"               /tmp/tf_apply.txt && ERROR_TYPE="TF_CONFLICT"
+            grep -qiE "serviceAccountUser|PERMISSION_DENIED|403"  /tmp/tf_apply.txt \
               && ERROR_TYPE="${ERROR_TYPE},TF_PERMISSION"
-            grep -qiE "quota|RESOURCE_EXHAUSTED|429"             /tmp/tf_apply.txt && ERROR_TYPE="TF_QUOTA"
-            grep -qiE "timeout|deadline exceeded"                /tmp/tf_apply.txt && ERROR_TYPE="TF_TIMEOUT"
+            grep -qiE "quota|RESOURCE_EXHAUSTED|429"              /tmp/tf_apply.txt && ERROR_TYPE="TF_QUOTA"
+            grep -qiE "timeout|deadline exceeded"                 /tmp/tf_apply.txt && ERROR_TYPE="TF_TIMEOUT"
             echo "TF_ERROR_TYPE=$ERROR_TYPE" >> $GITHUB_ENV
             echo "⚠ Terraform Apply FAILED (exit: $APPLY_EXIT) — $ERROR_TYPE"
             tail -30 /tmp/tf_apply.txt
@@ -201,6 +262,13 @@ jobs:
             echo "✓ Terraform Apply SUCCESS"
           fi
         continue-on-error: true
+
+      - name: Terraform Apply (khi Plan bị lỗi)
+        if: ${{ !inputs.dry_run && env.TF_PLAN_FAILED == 'true' }}
+        run: |
+          echo "TF_FAILED=true"           >> $GITHUB_ENV
+          echo "TF_ERROR_TYPE=TF_UNKNOWN" >> $GITHUB_ENV
+          echo "⚠ Terraform Plan đã thất bại — bỏ qua Apply"
 
       - name: Wait for resources to stabilize
         run: sleep 30
@@ -283,9 +351,9 @@ jobs:
               ref:         'main',
               inputs: {
                 trigger:        'WF1',
-                cis_fail_count: process.env.CIS_FAIL   || '0',
-                tf_failed:      process.env.TF_FAILED   || 'false',
-                error_type:     process.env.TF_ERROR_TYPE || 'NONE',
+                cis_fail_count: process.env.CIS_FAIL      || '0',
+                tf_failed:      process.env.TF_FAILED      || 'false',
+                error_type:     process.env.TF_ERROR_TYPE  || 'NONE',
                 trigger_reason: process.env.TRIGGER_REASON || 'WF1',
               }
             });
