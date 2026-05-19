@@ -2,24 +2,36 @@ output "vpc_name" {
   value = google_compute_network.vpc.name
 }
 
-output "subnet_name" {
-  value = google_compute_subnetwork.subnet.name
+output "subnet_public_name" {
+  value = google_compute_subnetwork.subnet_public.name
+}
+
+output "subnet_private_name" {
+  value = google_compute_subnetwork.subnet_private.name
+}
+
+output "bastion_name" {
+  value = google_compute_instance.bastion.name
+}
+
+output "bastion_public_ip" {
+  value = google_compute_instance.bastion.network_interface[0].access_config[0].nat_ip
 }
 
 output "vm_name" {
   value = google_compute_instance.vm.name
 }
 
-output "vm_public_ip" {
-  value = google_compute_instance.vm.network_interface[0].access_config[0].nat_ip
+output "vm_private_ip" {
+  value = google_compute_instance.vm.network_interface[0].network_ip
 }
 
 output "postgres_instance_name" {
   value = google_sql_database_instance.postgres.name
 }
 
-output "postgres_public_ip" {
-  value = google_sql_database_instance.postgres.public_ip_address
+output "postgres_private_ip" {
+  value = google_sql_database_instance.postgres.private_ip_address
 }
 
 output "storage_bucket_name" {
@@ -44,4 +56,8 @@ output "kms_crypto_key_id" {
 
 output "dns_zone_name" {
   value = google_dns_managed_zone.public.name
+}
+
+output "nat_router_name" {
+  value = google_compute_router.nat_router.name
 }

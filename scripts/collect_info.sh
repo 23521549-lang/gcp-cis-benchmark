@@ -23,11 +23,16 @@ echo -e "${CYAN}================================================================
 # ── 1. Project metadata ──────────────────────────────────────────
 echo "[ 1/6 ] Project metadata..."
 PROJECT_INFO=$(gcloud projects describe "$PROJECT_ID" --format=json 2>/dev/null || echo '{}')
-PROJECT_NUMBER=$(echo "$PROJECT_INFO" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('projectNumber',''))" 2>/dev/null || echo "")
+PROJECT_NUMBER=$(echo "$PROJECT_INFO" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+print(d.get('projectNumber',''))
+" 2>/dev/null || echo "")
 
 # ── 2. IAM snapshot ──────────────────────────────────────────────
 echo "[ 2/6 ] IAM binding snapshot..."
-IAM_POLICY=$(gcloud projects get-iam-policy "$PROJECT_ID" --format=json 2>/dev/null || echo '{"bindings":[]}')
+IAM_POLICY=$(gcloud projects get-iam-policy "$PROJECT_ID" \
+  --format=json 2>/dev/null || echo '{"bindings":[]}')
 IAM_COUNT=$(echo "$IAM_POLICY" | python3 -c "
 import json,sys
 p=json.load(sys.stdin)
@@ -37,42 +42,69 @@ print(total)
 
 # ── 3. Resource inventory ────────────────────────────────────────
 echo "[ 3/6 ] Resource inventory..."
-VM_LIST=$(gcloud compute instances list --project="$PROJECT_ID" \
-  --format="json(name,zone,status,serviceAccounts[0].email)" 2>/dev/null || echo '[]')
-VM_COUNT=$(echo "$VM_LIST" | python3 -c "import json,sys; print(len(json.load(sys.stdin)))" 2>/dev/null || echo "0")
+VM_LIST=$(gcloud compute instances list \
+  --project="$PROJECT_ID" \
+  --format="json(name,zone,status,tags.items,networkInterfaces[0].subnetwork,networkInterfaces[0].accessConfigs)" \
+  2>/dev/null || echo '[]')
 
-BUCKET_LIST=$(gsutil ls -p "$PROJECT_ID" 2>/dev/null | sed 's|gs://||;s|/||' || echo "")
+VM_COUNT=$(echo "$VM_LIST" | python3 -c "
+import json,sys
+print(len(json.load(sys.stdin)))
+" 2>/dev/null || echo "0")
+
+BASTION_COUNT=$(echo "$VM_LIST" | python3 -c "
+import json,sys
+vms=json.load(sys.stdin)
+print(sum(1 for v in vms if 'bastion-vm' in v.get('tags',{}).get('items',[])))
+" 2>/dev/null || echo "0")
+
+PRIVATE_VM_COUNT=$(echo "$VM_LIST" | python3 -c "
+import json,sys
+vms=json.load(sys.stdin)
+print(sum(1 for v in vms if 'private-vm' in v.get('tags',{}).get('items',[])))
+" 2>/dev/null || echo "0")
+
+BUCKET_LIST=$(gsutil ls -p "$PROJECT_ID" 2>/dev/null | \
+  sed 's|gs://||;s|/||' || echo "")
 BUCKET_COUNT=$(echo "$BUCKET_LIST" | grep -c . 2>/dev/null || echo "0")
 
-SUBNET_LIST=$(gcloud compute networks subnets list --project="$PROJECT_ID" \
-  --format="json(name,region,ipCidrRange)" 2>/dev/null || echo '[]')
-
-FW_LIST=$(gcloud compute firewall-rules list --project="$PROJECT_ID" \
-  --format="json(name,direction,allowed,sourceRanges,targetTags)" 2>/dev/null || echo '[]')
-FW_COUNT=$(echo "$FW_LIST" | python3 -c "import json,sys; print(len(json.load(sys.stdin)))" 2>/dev/null || echo "0")
+FW_LIST=$(gcloud compute firewall-rules list \
+  --project="$PROJECT_ID" \
+  --format="json(name,direction,allowed,sourceRanges,targetTags)" \
+  2>/dev/null || echo '[]')
+FW_COUNT=$(echo "$FW_LIST" | python3 -c "
+import json,sys
+print(len(json.load(sys.stdin)))
+" 2>/dev/null || echo "0")
 
 # ── 4. Cloud SQL instances ───────────────────────────────────────
 echo "[ 4/6 ] Cloud SQL instances..."
-SQL_LIST=$(gcloud sql instances list --project="$PROJECT_ID" \
+SQL_LIST=$(gcloud sql instances list \
+  --project="$PROJECT_ID" \
   --format="json(name,databaseVersion,state,settings.ipConfiguration,settings.databaseFlags)" \
   2>/dev/null || echo '[]')
-SQL_COUNT=$(echo "$SQL_LIST" | python3 -c "import json,sys; print(len(json.load(sys.stdin)))" 2>/dev/null || echo "0")
+SQL_COUNT=$(echo "$SQL_LIST" | python3 -c "
+import json,sys
+print(len(json.load(sys.stdin)))
+" 2>/dev/null || echo "0")
 
 # ── 5. API services đang bật ──────────────────────────────────────
 echo "[ 5/6 ] Enabled API services..."
-API_LIST=$(gcloud services list --enabled --project="$PROJECT_ID" \
+API_LIST=$(gcloud services list --enabled \
+  --project="$PROJECT_ID" \
   --format="value(config.name)" 2>/dev/null | sort || echo "")
 API_COUNT=$(echo "$API_LIST" | grep -c . 2>/dev/null || echo "0")
 
-# Kiểm tra các API quan trọng CIS yêu cầu
 CLOUDASSET_ON=$(echo "$API_LIST" | grep -c "cloudasset.googleapis.com" || echo "0")
-SQLADMIN_ON=$(echo "$API_LIST"  | grep -c "sqladmin.googleapis.com"   || echo "0")
-SCC_ON=$(echo "$API_LIST"       | grep -c "securitycenter.googleapis.com" || echo "0")
+SQLADMIN_ON=$(echo "$API_LIST"   | grep -c "sqladmin.googleapis.com"   || echo "0")
+SCC_ON=$(echo "$API_LIST"        | grep -c "securitycenter.googleapis.com" || echo "0")
 
 # ── 6. KMS keyrings ──────────────────────────────────────────────
 echo "[ 6/6 ] KMS keyrings..."
 REGION="${REGION:-asia-southeast1}"
-KMS_LIST=$(gcloud kms keyrings list --location="$REGION" --project="$PROJECT_ID" \
+KMS_LIST=$(gcloud kms keyrings list \
+  --location="$REGION" \
+  --project="$PROJECT_ID" \
   --format="value(name)" 2>/dev/null || echo "")
 KMS_COUNT=$(echo "$KMS_LIST" | grep -c . 2>/dev/null || echo "0")
 
@@ -85,6 +117,8 @@ cat > "$OUTDIR/context_info.json" << JSONEOF
   "region": "$REGION",
   "resources": {
     "vms": $VM_COUNT,
+    "bastion_vms": $BASTION_COUNT,
+    "private_vms": $PRIVATE_VM_COUNT,
     "buckets": $BUCKET_COUNT,
     "firewall_rules": $FW_COUNT,
     "sql_instances": $SQL_COUNT,
@@ -106,6 +140,6 @@ JSONEOF
 echo "$IAM_POLICY" > "$OUTDIR/iam_snapshot.json"
 
 echo ""
-echo -e "${GREEN}[OK]${RESET} context_info.json — VMs:$VM_COUNT Buckets:$BUCKET_COUNT SQL:$SQL_COUNT FW:$FW_COUNT"
+echo -e "${GREEN}[OK]${RESET} context_info.json — VMs:$VM_COUNT (Bastion:$BASTION_COUNT Private:$PRIVATE_VM_COUNT) Buckets:$BUCKET_COUNT SQL:$SQL_COUNT FW:$FW_COUNT"
 echo -e "${GREEN}[OK]${RESET} iam_snapshot.json  — $IAM_COUNT bindings"
 echo -e "${GREEN}[OK]${RESET} API: cloudasset=$CLOUDASSET_ON sqladmin=$SQLADMIN_ON scc=$SCC_ON"

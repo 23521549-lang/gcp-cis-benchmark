@@ -28,7 +28,7 @@ variable "db_password" {
 
 variable "allowed_client_cidr" {
   type        = string
-  description = "IP CIDR được phép SSH vào VM (CIS 3.6)"
+  description = "IP CIDR được phép SSH vào Bastion VM (CIS 3.6)"
   sensitive   = true
 }
 
@@ -42,6 +42,3 @@ variable "alert_email" {
   description = "Email nhận cảnh báo bảo mật"
   default     = "23521549@gm.uit.edu.vn"
 }
-
-# Last updated: 2026-05-14
-# Last updated: 2026-05-14

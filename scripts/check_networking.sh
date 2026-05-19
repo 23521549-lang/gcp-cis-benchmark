@@ -2,7 +2,7 @@
 # ================================================================
 # CIS GCP Benchmark v4.0.0 — Domain 3: Networking
 # CIS 3.1 / 3.3 / 3.6 / 3.7 / 3.8
-# FIX: bỏ set -e để script không bị cắt giữa chừng
+# Hỗ trợ kiến trúc multi-subnet: Public + Private
 # ================================================================
 set -uo pipefail
 
@@ -56,12 +56,13 @@ print('\n'.join(off))
     pass "3.3 Tất cả $TOTAL_ZONES DNS zone đã bật DNSSEC"
   else
     fail "3.3 DNS zones chưa bật DNSSEC:"
-    echo "$DNSSEC_OFF" | while IFS= read -r line; do [ -n "$line" ] && info "$line"; done
+    echo "$DNSSEC_OFF" | while IFS= read -r line; do
+      [ -n "$line" ] && info "$line"
+    done
     info "Fix: cập nhật dnssec_config { state = 'on' } trong vpc.tf"
   fi
 else
   fail "3.3 Không có DNS Zone nào"
-  info "Fix: thêm google_dns_managed_zone với dnssec_config trong vpc.tf"
 fi
 echo ""
 
@@ -91,8 +92,10 @@ if [ -z "$SSH_OPEN" ]; then
   pass "3.6 SSH (port 22) không mở cho 0.0.0.0/0"
 else
   fail "3.6 Phát hiện rule mở SSH cho toàn Internet:"
-  echo "$SSH_OPEN" | while IFS= read -r line; do [ -n "$line" ] && info "$line"; done
-  info "Fix: giới hạn source_ranges xuống IP cụ thể trong terraform"
+  echo "$SSH_OPEN" | while IFS= read -r line; do
+    [ -n "$line" ] && info "$line"
+  done
+  info "Fix: chỉ cho phép SSH đến bastion-vm từ IP cụ thể"
 fi
 echo ""
 
@@ -109,7 +112,8 @@ for r in rules:
     sources = r.get('sourceRanges', [])
     if '0.0.0.0/0' not in sources and '::/0' not in sources: continue
     for a in r.get('allowed', []):
-        if any('3389' in str(p) for p in a.get('ports', [])): found.append(r['name'])
+        if any('3389' in str(p) for p in a.get('ports', [])):
+            found.append(r['name'])
 print('\n'.join(set(found)))
 " 2>/dev/null || echo "")
 
@@ -117,7 +121,9 @@ if [ -z "$RDP_OPEN" ]; then
   pass "3.7 RDP (port 3389) không mở cho 0.0.0.0/0"
 else
   fail "3.7 Phát hiện rule mở RDP cho toàn Internet:"
-  echo "$RDP_OPEN" | while IFS= read -r line; do [ -n "$line" ] && info "$line"; done
+  echo "$RDP_OPEN" | while IFS= read -r line; do
+    [ -n "$line" ] && info "$line"
+  done
 fi
 echo ""
 
@@ -129,14 +135,22 @@ FLOW_RESULT=$(gcloud compute networks subnets list \
 import json, sys
 subnets = json.load(sys.stdin)
 ok = []; issues = []
+# Bỏ qua managed proxy subnets, chỉ check subnet thực của project
+skip_purposes = [
+    'REGIONAL_MANAGED_PROXY',
+    'GLOBAL_MANAGED_PROXY',
+    'PRIVATE_SERVICE_CONNECT',
+    'INTERNAL_HTTPS_LOAD_BALANCER'
+]
 for s in subnets:
-    if s.get('purpose','PRIVATE') not in ['PRIVATE','']: continue
-    name = s.get('name','?')
+    if s.get('purpose','PRIVATE') in skip_purposes: continue
+    name   = s.get('name','?')
     region = s.get('region','').split('/')[-1]
     enabled = s.get('enableFlowLogs', False)
     lc = s.get('logConfig', {})
     fails = []
-    if not enabled: fails.append('FlowLogs=off')
+    if not enabled:
+        fails.append('FlowLogs=off')
     if lc.get('aggregationInterval') != 'INTERVAL_5_SEC':
         fails.append(f'Interval={lc.get(\"aggregationInterval\",\"N/A\")}')
     if str(lc.get('flowSampling','')) not in ['1.0','1']:
@@ -156,12 +170,38 @@ else
   OK_COUNT=$(echo "$FLOW_RESULT"   | grep -c "^OK:"   || true)
   if [ "$FAIL_COUNT" -eq 0 ] && [ "$OK_COUNT" -gt 0 ]; then
     pass "3.8 Tất cả $OK_COUNT subnet đã bật VPC Flow Logs đúng cấu hình CIS"
+    echo "$FLOW_RESULT" | grep "^OK:" | while IFS= read -r line; do
+      info "${line#OK:}"
+    done
   elif [ "$FAIL_COUNT" -gt 0 ]; then
     fail "3.8 Phát hiện subnet chưa đúng cấu hình CIS 3.8:"
-    echo "$FLOW_RESULT" | grep "^FAIL:" | while IFS= read -r line; do info "${line#FAIL:}"; done
+    echo "$FLOW_RESULT" | grep "^FAIL:" | while IFS= read -r line; do
+      info "${line#FAIL:}"
+    done
   else
-    fail "3.8 Không tìm thấy subnet PRIVATE nào"
+    fail "3.8 Không tìm thấy subnet nào cần check"
   fi
+fi
+echo ""
+
+# ── Bonus: Cloud NAT check ────────────────────────────────────────
+echo "[ NAT ] Kiểm tra Cloud NAT cho Private Subnet..."
+NAT_COUNT=$(gcloud compute routers list \
+  --project="$PROJECT_ID" \
+  --format=json 2>/dev/null | python3 -c "
+import json,sys
+routers = json.load(sys.stdin)
+nat_count = 0
+for r in routers:
+    for nat in r.get('nats', []):
+        nat_count += 1
+print(nat_count)
+" 2>/dev/null || echo "0")
+
+if [ "${NAT_COUNT:-0}" -gt 0 ]; then
+  echo -e "${GREEN}[INFO]${RESET} Cloud NAT tồn tại ($NAT_COUNT NAT) — Private VMs có outbound internet"
+else
+  echo -e "${YELLOW}[INFO]${RESET} Không có Cloud NAT — Private VMs không có outbound internet"
 fi
 echo ""
 

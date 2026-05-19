@@ -1,5 +1,5 @@
 # ================================================================
-# CIS 3.1 — Default network không tồn tại
+# CIS 3.1 — Xóa default network
 # ================================================================
 resource "null_resource" "delete_default_network" {
   provisioner "local-exec" {
@@ -19,10 +19,11 @@ resource "google_compute_network" "vpc" {
 }
 
 # ================================================================
+# Subnet 1 — Public (Bastion Host)
 # CIS 3.8 — VPC Flow Logs
 # ================================================================
-resource "google_compute_subnetwork" "subnet" {
-  name          = "benchmark-subnet"
+resource "google_compute_subnetwork" "subnet_public" {
+  name          = "benchmark-subnet-public"
   ip_cidr_range = "10.10.0.0/24"
   region        = var.region
   network       = google_compute_network.vpc.id
@@ -35,9 +36,48 @@ resource "google_compute_subnetwork" "subnet" {
 }
 
 # ================================================================
+# Subnet 2 — Private App (App VM, no public IP)
+# CIS 3.8 — VPC Flow Logs
+# ================================================================
+resource "google_compute_subnetwork" "subnet_private" {
+  name                     = "benchmark-subnet-private"
+  ip_cidr_range            = "10.20.0.0/24"
+  region                   = var.region
+  network                  = google_compute_network.vpc.id
+  private_ip_google_access = true # App VM truy cập GCP APIs không cần Public IP
+
+  log_config {
+    aggregation_interval = "INTERVAL_5_SEC"
+    flow_sampling        = 1
+    metadata             = "INCLUDE_ALL_METADATA"
+  }
+}
+
+# ================================================================
+# Cloud NAT — cho Private VMs ra internet (download packages, etc)
+# ================================================================
+resource "google_compute_router" "nat_router" {
+  name    = "benchmark-nat-router"
+  region  = var.region
+  network = google_compute_network.vpc.id
+}
+
+resource "google_compute_router_nat" "cloud_nat" {
+  name                               = "benchmark-cloud-nat"
+  router                             = google_compute_router.nat_router.name
+  region                             = var.region
+  nat_ip_allocate_option             = "AUTO_ONLY"
+  source_subnetwork_ip_ranges_to_nat = "LIST_OF_SUBNETWORKS"
+
+  subnetwork {
+    name                    = google_compute_subnetwork.subnet_private.id
+    source_ip_ranges_to_nat = ["ALL_IP_RANGES"]
+  }
+}
+
+# ================================================================
 # CIS 2.12 — DNS Logging
-# CIS 3.3 — DNSSEC chỉ áp dụng cho public zone
-#            Private zone không hỗ trợ DNSSEC — tạo public zone riêng
+# CIS 3.3 — DNSSEC cho public zone
 # ================================================================
 resource "google_dns_managed_zone" "private" {
   name        = "benchmark-private-zone"
@@ -55,7 +95,7 @@ resource "google_dns_managed_zone" "private" {
 resource "google_dns_managed_zone" "public" {
   name        = "benchmark-public-zone"
   dns_name    = "benchmark-cis.com."
-  description = "Public DNS zone with DNSSEC enabled (CIS 3.3)"
+  description = "Public DNS zone with DNSSEC (CIS 3.3)"
   visibility  = "public"
 
   dnssec_config {
@@ -64,7 +104,7 @@ resource "google_dns_managed_zone" "public" {
   }
 }
 
-# CIS 2.12 — DNS Logging bật cho VPC
+# CIS 2.12 — DNS Logging
 resource "google_dns_policy" "dns_logging" {
   name           = "benchmark-dns-logging-policy"
   enable_logging = true
@@ -75,11 +115,14 @@ resource "google_dns_policy" "dns_logging" {
 }
 
 # ================================================================
-# CIS 3.6 — SSH chỉ từ IP cụ thể
-# CIS 3.7 — Không có rule nào mở RDP
+# Firewall Rules
+# CIS 3.6 — SSH chỉ từ IP cụ thể vào Bastion
+# CIS 3.7 — Không mở RDP
 # ================================================================
-resource "google_compute_firewall" "allow_ssh" {
-  name    = "benchmark-allow-ssh"
+
+# Allow SSH từ IP cụ thể vào Bastion (Public Subnet)
+resource "google_compute_firewall" "allow_ssh_bastion" {
+  name    = "benchmark-allow-ssh-bastion"
   network = google_compute_network.vpc.name
 
   allow {
@@ -88,10 +131,47 @@ resource "google_compute_firewall" "allow_ssh" {
   }
 
   source_ranges = [var.allowed_client_cidr]
-  target_tags   = ["benchmark-vm"]
-  description   = "CIS 3.6 — SSH only from allowed IP"
+  target_tags   = ["bastion-vm"]
+  description   = "CIS 3.6 — SSH only from allowed IP to Bastion"
 }
 
+# Allow SSH từ Bastion vào Private VMs (internal only)
+resource "google_compute_firewall" "allow_ssh_internal" {
+  name    = "benchmark-allow-ssh-internal"
+  network = google_compute_network.vpc.name
+
+  allow {
+    protocol = "tcp"
+    ports    = ["22"]
+  }
+
+  source_tags = ["bastion-vm"]
+  target_tags = ["private-vm"]
+  description = "Allow SSH from Bastion to Private VMs"
+}
+
+# Allow internal traffic giữa các VM
+resource "google_compute_firewall" "allow_internal" {
+  name    = "benchmark-allow-internal"
+  network = google_compute_network.vpc.name
+
+  allow {
+    protocol = "tcp"
+    ports    = ["0-65535"]
+  }
+  allow {
+    protocol = "udp"
+    ports    = ["0-65535"]
+  }
+  allow {
+    protocol = "icmp"
+  }
+
+  source_ranges = ["10.10.0.0/24", "10.20.0.0/24"]
+  description   = "Allow internal traffic between subnets"
+}
+
+# Deny all ingress by default
 resource "google_compute_firewall" "deny_all_ingress" {
   name      = "benchmark-deny-all-ingress"
   network   = google_compute_network.vpc.name
@@ -103,5 +183,5 @@ resource "google_compute_firewall" "deny_all_ingress" {
   }
 
   source_ranges = ["0.0.0.0/0"]
-  description   = "Deny all ingress by default"
+  description   = "CIS 3.7 — Deny all ingress by default"
 }

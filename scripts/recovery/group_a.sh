@@ -2,11 +2,13 @@
 # ================================================================
 # Nhóm A — CIS policy tự động fix bằng gcloud
 # 21 controls: IAM, Logging, Network, VM, Storage, Cloud SQL
+# Hỗ trợ kiến trúc multi-subnet: Public + Private
 # ================================================================
 set -uo pipefail
 
 PROJECT_ID=$(gcloud config get-value project 2>/dev/null)
 VM_NAME="${VM_NAME:-benchmark-vm-01}"
+BASTION_NAME="${BASTION_NAME:-benchmark-bastion-01}"
 VM_ZONE="${VM_ZONE:-asia-southeast1-a}"
 REGION="${REGION:-asia-southeast1}"
 CUSTOM_SA="${CUSTOM_SA:-app-least-privilege-sa@${PROJECT_ID}.iam.gserviceaccount.com}"
@@ -27,11 +29,10 @@ run() {
 fixed() { echo -e "${GREEN}[FIXED]${RESET} $1"; FIXED=$((FIXED+1)); }
 err()   { echo -e "${RED}[ERROR]${RESET} $1";   FAILED=$((FAILED+1)); }
 
-# Kiểm tra control có cần fix không
 needs_fix() {
   local cid="$1"
   if [ ! -f "$FAIL_LIST_FILE" ]; then
-    return 0  # full mode: fix tất cả
+    return 0  # full mode
   fi
   jq -r '.[]' "$FAIL_LIST_FILE" 2>/dev/null | grep -qw "$cid"
 }
@@ -42,11 +43,7 @@ echo "  Project: $PROJECT_ID | DRY_RUN: $DRY_RUN"
 echo "================================================================"
 echo ""
 
-# ================================================================
-# DOMAIN 1 — IAM
-# ================================================================
-
-# CIS 1.4 — Xóa user-managed SA keys
+# ── CIS 1.4 — Xóa user-managed SA keys ──────────────────────────
 if needs_fix "1.4"; then
   echo "[ 1.4 ] Xóa user-managed SA keys..."
   gcloud iam service-accounts list \
@@ -67,7 +64,7 @@ if needs_fix "1.4"; then
   fixed "CIS 1.4 — user-managed keys đã xóa"
 fi
 
-# CIS 1.5 — Xóa Admin bindings của SA
+# ── CIS 1.5 — Xóa Admin bindings của SA ──────────────────────────
 if needs_fix "1.5"; then
   echo "[ 1.5 ] Xóa Admin privileges của SA..."
   ADMIN_BINDINGS=$(gcloud projects get-iam-policy "$PROJECT_ID" \
@@ -92,11 +89,10 @@ for b in policy.get('bindings',[]):
     fixed "CIS 1.5 — Admin SA bindings đã xóa"
   else
     echo "  Không có binding nào cần xóa"
-    fixed "CIS 1.5 — OK"
   fi
 fi
 
-# CIS 1.10 — KMS rotation 90 ngày
+# ── CIS 1.10 — KMS rotation 90 ngày ─────────────────────────────
 if needs_fix "1.10"; then
   echo "[ 1.10 ] Cập nhật KMS rotation..."
   gcloud kms keyrings list \
@@ -122,29 +118,11 @@ if needs_fix "1.10"; then
   fixed "CIS 1.10 — KMS rotation 90 ngày"
 fi
 
-# CIS 1.14 — API Key restrictions (chỉ verify, không tự fix)
-if needs_fix "1.14"; then
-  echo "[ 1.14 ] Kiểm tra API key restrictions..."
-  API_KEYS=$(gcloud services api-keys list \
-    --project="$PROJECT_ID" \
-    --format="value(name)" 2>/dev/null || echo "")
-  if [ -z "$API_KEYS" ]; then
-    echo "  Không có API key nào — OK"
-  else
-    echo "  Có API keys — cần kiểm tra restrictions thủ công (Nhóm C)"
-  fi
-fi
-
-# ================================================================
-# DOMAIN 2 — Logging
-# ================================================================
-
-# CIS 2.1 — Patch Audit Logging
+# ── CIS 2.1 — Patch Audit Logging ────────────────────────────────
 if needs_fix "2.1"; then
   echo "[ 2.1 ] Patch Cloud Audit Logging..."
   CURRENT_POLICY=$(gcloud projects get-iam-policy "$PROJECT_ID" \
     --format=json 2>/dev/null || echo '{"bindings":[]}')
-
   PATCHED=$(echo "$CURRENT_POLICY" | python3 -c "
 import json, sys
 policy = json.load(sys.stdin)
@@ -163,7 +141,6 @@ else:
 policy['auditConfigs'] = configs
 print(json.dumps(policy))
 " 2>/dev/null)
-
   if [ -n "$PATCHED" ]; then
     echo "$PATCHED" > /tmp/patched_policy.json
     run gcloud projects set-iam-policy "$PROJECT_ID" \
@@ -173,28 +150,77 @@ print(json.dumps(policy))
   fi
 fi
 
-# CIS 2.12 — DNS Logging
+# ── CIS 2.2 — Tạo Log Sink ───────────────────────────────────────
+if needs_fix "2.2"; then
+  echo "[ 2.2 ] Tạo/fix Log Sink đến Storage Bucket..."
+  SINK_BUCKET=$(gcloud logging sinks list \
+    --project="$PROJECT_ID" \
+    --format="value(destination)" 2>/dev/null | \
+    grep "storage.googleapis.com" | head -1 | \
+    sed 's|storage.googleapis.com/||' || echo "")
+
+  if [ -z "$SINK_BUCKET" ]; then
+    SINK_BUCKET=$(gsutil ls -p "$PROJECT_ID" 2>/dev/null | \
+      grep "benchmark-storage" | head -1 | \
+      sed 's|gs://||;s|/||' || echo "")
+  fi
+
+  if [ -n "$SINK_BUCKET" ]; then
+    EXISTING=$(gcloud logging sinks list \
+      --project="$PROJECT_ID" \
+      --filter="name=benchmark-log-sink" \
+      --format="value(name)" 2>/dev/null || echo "")
+
+    if [ -z "$EXISTING" ]; then
+      run gcloud logging sinks create benchmark-log-sink \
+        "storage.googleapis.com/$SINK_BUCKET" \
+        --project="$PROJECT_ID" --quiet 2>/dev/null \
+        && fixed "CIS 2.2 — Log sink tạo thành công" \
+        || err "CIS 2.2 — Không tạo được log sink"
+
+      WRITER=$(gcloud logging sinks describe benchmark-log-sink \
+        --project="$PROJECT_ID" \
+        --format="value(writerIdentity)" 2>/dev/null || echo "")
+      [ -n "$WRITER" ] && \
+        run gsutil iam ch "${WRITER}:objectCreator" \
+          "gs://$SINK_BUCKET" 2>/dev/null || true
+    else
+      CURRENT_FILTER=$(gcloud logging sinks describe benchmark-log-sink \
+        --project="$PROJECT_ID" \
+        --format="value(filter)" 2>/dev/null || echo "")
+      if [ -n "$CURRENT_FILTER" ] && [ "$CURRENT_FILTER" != "(empty filter)" ]; then
+        run gcloud logging sinks update benchmark-log-sink \
+          --project="$PROJECT_ID" \
+          --log-filter="" --quiet 2>/dev/null \
+          && fixed "CIS 2.2 — Filter đã xóa khỏi sink" \
+          || err "CIS 2.2 — Không xóa được filter"
+      else
+        fixed "CIS 2.2 — Sink đã tồn tại và không có filter"
+      fi
+    fi
+  else
+    err "CIS 2.2 — Không tìm thấy bucket để tạo sink"
+  fi
+fi
+
+# ── CIS 2.12 — DNS Logging ────────────────────────────────────────
 if needs_fix "2.12"; then
   echo "[ 2.12 ] Bật DNS logging..."
   VPC_NAME=$(gcloud compute networks list \
-    --project="$PROJECT_ID" \
-    --filter="name!=default" \
-    --format="value(name)" 2>/dev/null | head -1)
-
+    --project="$PROJECT_ID" --format="value(name)" \
+    --filter="name!=default" 2>/dev/null | head -1)
   if [ -n "$VPC_NAME" ]; then
-    EXISTING_POLICY=$(gcloud dns policies list \
-      --project="$PROJECT_ID" \
-      --format="value(name)" 2>/dev/null | head -1)
-
-    if [ -n "$EXISTING_POLICY" ]; then
-      run gcloud dns policies update "$EXISTING_POLICY" \
+    EXISTING_DNS=$(gcloud dns policies list \
+      --project="$PROJECT_ID" --format="value(name)" \
+      2>/dev/null | head -1)
+    if [ -n "$EXISTING_DNS" ]; then
+      run gcloud dns policies update "$EXISTING_DNS" \
         --enable-logging --project="$PROJECT_ID" 2>/dev/null \
         && fixed "CIS 2.12 — DNS logging updated" \
         || err "CIS 2.12 — Không update DNS policy"
     else
-      run gcloud dns policies create "enable-dns-logging" \
-        --enable-logging \
-        --networks="$VPC_NAME" \
+      run gcloud dns policies create enable-dns-logging \
+        --enable-logging --networks="$VPC_NAME" \
         --project="$PROJECT_ID" 2>/dev/null \
         && fixed "CIS 2.12 — DNS logging created" \
         || err "CIS 2.12 — Không tạo DNS policy"
@@ -202,7 +228,7 @@ if needs_fix "2.12"; then
   fi
 fi
 
-# CIS 2.13 — Cloud Asset API
+# ── CIS 2.13 — Cloud Asset API ───────────────────────────────────
 if needs_fix "2.13"; then
   echo "[ 2.13 ] Bật Cloud Asset Inventory API..."
   run gcloud services enable cloudasset.googleapis.com \
@@ -211,20 +237,14 @@ if needs_fix "2.13"; then
     || err "CIS 2.13 — Không enable được API"
 fi
 
-# ================================================================
-# DOMAIN 3 — Networking
-# ================================================================
-
-# CIS 3.1 — Xóa default network
+# ── CIS 3.1 — Xóa default network ────────────────────────────────
 if needs_fix "3.1"; then
   echo "[ 3.1 ] Xóa default network..."
   DEFAULT_NET=$(gcloud compute networks list \
     --project="$PROJECT_ID" \
     --filter="name=default" \
     --format="value(name)" 2>/dev/null)
-
   if [ -n "$DEFAULT_NET" ]; then
-    # Xóa firewall rules trước
     gcloud compute firewall-rules list \
       --project="$PROJECT_ID" \
       --filter="network=default" \
@@ -237,26 +257,24 @@ if needs_fix "3.1"; then
       && fixed "CIS 3.1 — Default network đã xóa" \
       || err "CIS 3.1 — Không xóa được default network"
   else
-    fixed "CIS 3.1 — Default network không tồn tại"
+    echo "  Default network không tồn tại — skip"
   fi
 fi
 
-# CIS 3.7 — Xóa RDP rule mở 0.0.0.0/0
+# ── CIS 3.7 — Xóa RDP rule mở 0.0.0.0/0 ────────────────────────
 if needs_fix "3.7"; then
   echo "[ 3.7 ] Xóa RDP firewall rule mở 0.0.0.0/0..."
   gcloud compute firewall-rules list \
-    --project="$PROJECT_ID" \
-    --format=json 2>/dev/null | python3 -c "
+    --project="$PROJECT_ID" --format=json 2>/dev/null | python3 -c "
 import json, sys
 rules = json.load(sys.stdin)
 for r in rules:
-    for a in r.get('allowed', []):
-        ports = a.get('ports', [])
-        if any('3389' in str(p) for p in ports):
-            sources = r.get('sourceRanges', [])
+    for a in r.get('allowed',[]):
+        if '3389' in str(a.get('ports',[])):
+            sources = r.get('sourceRanges',[])
             if '0.0.0.0/0' in sources or '::/0' in sources:
                 print(r['name'])
-" 2>/dev/null | while read FR; do
+" | while read FR; do
     run gcloud compute firewall-rules delete "$FR" \
       --project="$PROJECT_ID" --quiet 2>/dev/null \
       && echo "  Deleted RDP rule: $FR" \
@@ -265,31 +283,36 @@ for r in rules:
   fixed "CIS 3.7 — RDP rules 0.0.0.0/0 đã xóa"
 fi
 
-# CIS 3.8 — VPC Flow Logs
+# ── CIS 3.8 — VPC Flow Logs (hỗ trợ multi-subnet) ───────────────
 if needs_fix "3.8"; then
-  echo "[ 3.8 ] Bật VPC Flow Logs..."
+  echo "[ 3.8 ] Bật VPC Flow Logs trên tất cả subnet..."
+  SKIP_PURPOSES="REGIONAL_MANAGED_PROXY GLOBAL_MANAGED_PROXY PRIVATE_SERVICE_CONNECT"
   gcloud compute networks subnets list \
     --project="$PROJECT_ID" \
     --filter="region:$REGION" \
-    --format="value(name,region)" 2>/dev/null | while read SUBNET REG; do
-    run gcloud compute networks subnets update "$SUBNET" \
-      --region="$REG" \
-      --enable-flow-logs \
-      --logging-aggregation-interval=INTERVAL_5_SEC \
-      --logging-flow-sampling=0.5 \
-      --logging-metadata=INCLUDE_ALL_METADATA \
-      --project="$PROJECT_ID" 2>/dev/null \
-      && echo "  Enabled flow logs: $SUBNET" \
-      || err "Không enable được flow logs: $SUBNET"
-  done
-  fixed "CIS 3.8 — VPC Flow Logs enabled"
+    --format="value(name,region,purpose)" 2>/dev/null | \
+    while read SUBNET REG PURPOSE; do
+      # Bỏ qua managed proxy subnets
+      SKIP=false
+      for SP in $SKIP_PURPOSES; do
+        [ "$PURPOSE" = "$SP" ] && SKIP=true && break
+      done
+      [ "$SKIP" = "true" ] && continue
+
+      run gcloud compute networks subnets update "$SUBNET" \
+        --region="$REG" \
+        --enable-flow-logs \
+        --logging-aggregation-interval=INTERVAL_5_SEC \
+        --logging-flow-sampling=0.5 \
+        --logging-metadata=INCLUDE_ALL_METADATA \
+        --project="$PROJECT_ID" 2>/dev/null \
+        && echo "  Flow logs enabled: $SUBNET ($REG)" \
+        || err "Không enable được flow logs: $SUBNET"
+    done
+  fixed "CIS 3.8 — VPC Flow Logs enabled (tất cả subnet)"
 fi
 
-# ================================================================
-# DOMAIN 4 — Virtual Machines
-# ================================================================
-
-# CIS 4.3 — Block project-wide SSH keys
+# ── CIS 4.3 — Block project-wide SSH keys (cả 2 VM) ─────────────
 if needs_fix "4.3"; then
   echo "[ 4.3 ] Block project-wide SSH keys..."
   gcloud compute instances list \
@@ -300,12 +323,12 @@ if needs_fix "4.3"; then
       --metadata="block-project-ssh-keys=true" \
       --project="$PROJECT_ID" 2>/dev/null \
       && echo "  Done: $VM" \
-      || err "Không update được metadata: $VM"
+      || err "Không update được: $VM"
   done
-  fixed "CIS 4.3 — Block project SSH keys"
+  fixed "CIS 4.3 — Block project SSH keys (Bastion + App VM)"
 fi
 
-# CIS 4.4 — OS Login
+# ── CIS 4.4 — OS Login (cả 2 VM) ────────────────────────────────
 if needs_fix "4.4"; then
   echo "[ 4.4 ] Bật OS Login..."
   gcloud compute instances list \
@@ -316,12 +339,12 @@ if needs_fix "4.4"; then
       --metadata="enable-oslogin=true" \
       --project="$PROJECT_ID" 2>/dev/null \
       && echo "  Done: $VM" \
-      || err "Không update được metadata: $VM"
+      || err "Không update được: $VM"
   done
-  fixed "CIS 4.4 — OS Login enabled"
+  fixed "CIS 4.4 — OS Login enabled (Bastion + App VM)"
 fi
 
-# CIS 4.5 — Tắt serial port
+# ── CIS 4.5 — Tắt serial port (cả 2 VM) ─────────────────────────
 if needs_fix "4.5"; then
   echo "[ 4.5 ] Tắt serial port..."
   gcloud compute instances list \
@@ -332,16 +355,12 @@ if needs_fix "4.5"; then
       --metadata="serial-port-enable=false" \
       --project="$PROJECT_ID" 2>/dev/null \
       && echo "  Done: $VM" \
-      || err "Không update được metadata: $VM"
+      || err "Không update được: $VM"
   done
-  fixed "CIS 4.5 — Serial port disabled"
+  fixed "CIS 4.5 — Serial port disabled (Bastion + App VM)"
 fi
 
-# ================================================================
-# DOMAIN 5 — Storage
-# ================================================================
-
-# CIS 5.1 — Bucket không public
+# ── CIS 5.1 — Bucket không public ────────────────────────────────
 if needs_fix "5.1"; then
   echo "[ 5.1 ] Xóa public access từ buckets..."
   gsutil ls -p "$PROJECT_ID" 2>/dev/null | while read BUCKET; do
@@ -352,7 +371,7 @@ if needs_fix "5.1"; then
   fixed "CIS 5.1 — Bucket public access removed"
 fi
 
-# CIS 5.2 — Uniform Bucket-Level Access
+# ── CIS 5.2 — Uniform Bucket-Level Access ────────────────────────
 if needs_fix "5.2"; then
   echo "[ 5.2 ] Bật Uniform Bucket-Level Access..."
   gsutil ls -p "$PROJECT_ID" 2>/dev/null | while read BUCKET; do
@@ -363,10 +382,7 @@ if needs_fix "5.2"; then
   fixed "CIS 5.2 — Uniform access enabled"
 fi
 
-# ================================================================
-# DOMAIN 6 — Cloud SQL PostgreSQL
-# Patch tất cả flags trong 1 lệnh để chỉ restart 1 lần
-# ================================================================
+# ── Domain 6: Cloud SQL PostgreSQL ───────────────────────────────
 SQL_INSTANCE=$(gcloud sql instances list \
   --project="$PROJECT_ID" \
   --filter="databaseVersion~POSTGRES" \
@@ -386,7 +402,7 @@ if [ -n "$SQL_INSTANCE" ]; then
       || err "CIS 6.4 — Không patch được SSL"
   fi
 
-  # CIS 6.2.x + 6.2.8 — Database flags (1 lệnh, 1 restart)
+  # CIS 6.2.x — Database flags (1 lệnh, 1 restart)
   SQL_FLAGS_NEW=()
   needs_fix "6.2.1" && SQL_FLAGS_NEW+=("log_error_verbosity=default")
   needs_fix "6.2.2" && SQL_FLAGS_NEW+=("log_connections=on")
@@ -396,8 +412,6 @@ if [ -n "$SQL_INSTANCE" ]; then
 
   if [ ${#SQL_FLAGS_NEW[@]} -gt 0 ]; then
     echo "  [ 6.2.x ] Patch database flags..."
-
-    # Đọc flags hiện tại, merge với flags mới
     OVERRIDE_NAMES="log_error_verbosity log_connections log_disconnections log_statement cloudsql.enable_pgaudit"
     CURRENT_FLAGS=$(gcloud sql instances describe "$SQL_INSTANCE" \
       --project="$PROJECT_ID" \
@@ -417,7 +431,7 @@ print(','.join(keep))
     run gcloud sql instances patch "$SQL_INSTANCE" \
       --database-flags="$ALL_FLAGS" \
       --project="$PROJECT_ID" --quiet 2>/dev/null \
-      && fixed "CIS 6.2.x + 6.2.8 — database flags patched" \
+      && fixed "CIS 6.2.x + 6.2.8 — database flags patched (1 restart)" \
       || err "CIS 6.2.x — Không patch được database flags"
   fi
 fi

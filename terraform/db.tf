@@ -2,7 +2,6 @@
 # Cloud SQL PostgreSQL — CIS v4.0.0 compliant
 # Domain 6: 6.4, 6.2.1, 6.2.2, 6.2.3, 6.2.4, 6.2.8
 # ================================================================
-
 resource "google_project_service" "sqladmin" {
   service            = "sqladmin.googleapis.com"
   disable_on_destroy = false
@@ -13,12 +12,22 @@ resource "google_project_service" "servicenetworking" {
   disable_on_destroy = false
 }
 
+# Private IP range cho Cloud SQL (VPC Peering)
 resource "google_compute_global_address" "private_ip_range" {
   name          = "cloud-sql-private-range"
   purpose       = "VPC_PEERING"
   address_type  = "INTERNAL"
   prefix_length = 16
   network       = google_compute_network.vpc.self_link
+}
+
+# VPC Peering để SQL dùng Private IP
+resource "google_service_networking_connection" "private_vpc_connection" {
+  network                 = google_compute_network.vpc.id
+  service                 = "servicenetworking.googleapis.com"
+  reserved_peering_ranges = [google_compute_global_address.private_ip_range.name]
+
+  depends_on = [google_project_service.servicenetworking]
 }
 
 resource "google_sql_database_instance" "postgres" {
@@ -36,15 +45,11 @@ resource "google_sql_database_instance" "postgres" {
     availability_type = "ZONAL"
 
     ip_configuration {
-      ipv4_enabled = true
-
-      authorized_networks {
-        name  = "allowed-client"
-        value = var.allowed_client_cidr
-      }
-
-      # CIS 6.4 — SSL bắt buộc cho mọi connection
+      # CIS 6.4 — SSL bắt buộc
       require_ssl = true
+      # Private IP — không cần Public IP
+      ipv4_enabled    = false
+      private_network = google_compute_network.vpc.id
     }
 
     # CIS 6.2.1 — log_error_verbosity không được 'verbose'
@@ -71,13 +76,12 @@ resource "google_sql_database_instance" "postgres" {
       value = "ddl"
     }
 
-    # CIS 6.2.8 — pgAudit centralized logging
+    # CIS 6.2.8 — pgAudit
     database_flags {
       name  = "cloudsql.enable_pgaudit"
       value = "on"
     }
 
-    # Giữ nguyên các flags hiện có
     database_flags {
       name  = "log_min_messages"
       value = "warning"
@@ -89,7 +93,10 @@ resource "google_sql_database_instance" "postgres" {
     }
   }
 
-  depends_on = [google_project_service.sqladmin]
+  depends_on = [
+    google_project_service.sqladmin,
+    google_service_networking_connection.private_vpc_connection,
+  ]
 }
 
 resource "google_sql_database" "app" {
