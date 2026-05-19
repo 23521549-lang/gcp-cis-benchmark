@@ -1,7 +1,6 @@
 #!/bin/bash
 # ================================================================
-# CIS GCP Benchmark v4.0.0 — FULL CHECK (29 controls, 6 domain)
-# Gọi tất cả domain scripts, so sánh với baseline, xuất JSON
+# CIS GCP Benchmark v4.0.0 — FULL CHECK (29 controls, 6 domains)
 # Usage: ./cis_full_check.sh [text|json] [report_file] [baseline_file]
 # ================================================================
 set -uo pipefail
@@ -13,11 +12,12 @@ REPORT_FILE="${2:-/tmp/cis_report_$(date +%Y%m%d_%H%M%S).json}"
 BASELINE_FILE="${3:-/tmp/cis_baseline_latest.json}"
 
 GREEN="\033[0;32m"; RED="\033[0;31m"; YELLOW="\033[0;33m"
-CYAN="\033[0;36m";  RESET="\033[0m"
+CYAN="\033[0;36m"; RESET="\033[0m"
 
 TOTAL_PASS=0; TOTAL_FAIL=0
 DOMAIN_RESULTS=()
-FAIL_CONTROLS=()  # list control IDs bị FAIL — dùng cho WF4
+FAIL_CONTROLS=()
+REGRESSION_CONTROLS=()
 
 run_domain_check() {
   local domain_num="$1"
@@ -36,26 +36,30 @@ run_domain_check() {
   fi
 
   chmod +x "$SCRIPT_DIR/$script"
+  local OUTPUT
   OUTPUT=$("$SCRIPT_DIR/$script" 2>&1) || true
   echo "$OUTPUT"
 
+  local D_PASS D_FAIL
   D_PASS=$(echo "$OUTPUT" | grep -c "\[PASS\]" || true)
   D_FAIL=$(echo "$OUTPUT" | grep -c "\[FAIL\]" || true)
   TOTAL_PASS=$((TOTAL_PASS + D_PASS))
   TOTAL_FAIL=$((TOTAL_FAIL + D_FAIL))
 
-  # Trích xuất control IDs bị FAIL từ output
+  # Trích control IDs bị FAIL — match dạng "2.2", "6.2.1", v.v.
   while IFS= read -r line; do
     if echo "$line" | grep -q "\[FAIL\]"; then
-      CID=$(echo "$line" | grep -oP '(?<=\[FAIL\] )\d+\.\d+(\.\d+)?' || true)
+      CID=$(echo "$line" | grep -oP '\d+\.\d+(\.\d+)?' | head -1 || true)
       [ -n "$CID" ] && FAIL_CONTROLS+=("$CID")
     fi
   done <<< "$OUTPUT"
 
-  STATUS="PASS"; [ "$D_FAIL" -gt 0 ] && STATUS="FAIL"
+  local STATUS="PASS"
+  [ "$D_FAIL" -gt 0 ] && STATUS="FAIL"
   DOMAIN_RESULTS+=("{\"domain\":$domain_num,\"name\":\"$domain_name\",\"status\":\"$STATUS\",\"pass\":$D_PASS,\"fail\":$D_FAIL}")
 }
 
+# ── Banner ────────────────────────────────────────────────────────
 echo -e "${CYAN}"
 echo "  ╔══════════════════════════════════════════════════════╗"
 echo "  ║     CIS GCP Foundation Benchmark v4.0.0              ║"
@@ -65,6 +69,7 @@ echo "  ╚═══════════════════════
 echo -e "${RESET}"
 echo "  Started: $(date '+%Y-%m-%d %H:%M:%S')"
 
+# ── Chạy 6 domain ────────────────────────────────────────────────
 run_domain_check 1 "Identity & Access Management" "check_iam.sh"
 run_domain_check 2 "Logging & Monitoring"         "check_logging.sh"
 run_domain_check 3 "Networking"                   "check_networking.sh"
@@ -93,30 +98,37 @@ fi
 echo "  Completed: $(date '+%Y-%m-%d %H:%M:%S')"
 echo "════════════════════════════════════════════════════════════"
 
-# ── So sánh với baseline ──────────────────────────────────────────
-REGRESSION_CONTROLS=()
+# ── Baseline comparison ───────────────────────────────────────────
 if [ -f "$BASELINE_FILE" ]; then
   echo ""
   echo "  [ Baseline comparison ]"
   BASELINE_RATE=$(jq '.compliance_rate // 100' "$BASELINE_FILE" 2>/dev/null || echo "100")
-  echo "  Baseline rate: ${BASELINE_RATE}% | Current: ${COMPLIANCE_PCT}%"
-
+  echo "  Baseline: ${BASELINE_RATE}% | Current: ${COMPLIANCE_PCT}%"
   if [ "$COMPLIANCE_PCT" -lt "$BASELINE_RATE" ]; then
     DIFF=$((BASELINE_RATE - COMPLIANCE_PCT))
     echo -e "  ${RED}⚠ REGRESSION: giảm ${DIFF}% so với baseline${RESET}"
     REGRESSION_CONTROLS=("${FAIL_CONTROLS[@]}")
   else
-    echo -e "  ${GREEN}✓ Không có regression so với baseline${RESET}"
+    echo -e "  ${GREEN}✓ Không có regression${RESET}"
   fi
 fi
 
 # ── JSON output ───────────────────────────────────────────────────
 if [ "$OUTPUT_FORMAT" = "json" ]; then
   DOMAINS_JSON=$(IFS=','; echo "${DOMAIN_RESULTS[*]}")
-  FAIL_LIST_JSON=$(printf '%s\n' "${FAIL_CONTROLS[@]}" | \
-    python3 -c "import sys,json; print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))" 2>/dev/null || echo "[]")
-  REGRESSION_JSON=$(printf '%s\n' "${REGRESSION_CONTROLS[@]}" | \
-    python3 -c "import sys,json; print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))" 2>/dev/null || echo "[]")
+
+  # Build fail_controls JSON array
+  FAIL_JSON="[]"
+  if [ ${#FAIL_CONTROLS[@]} -gt 0 ]; then
+    FAIL_JSON=$(printf '%s\n' "${FAIL_CONTROLS[@]}" | \
+      python3 -c "import sys,json; print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))" 2>/dev/null || echo "[]")
+  fi
+
+  REGRESSION_JSON="[]"
+  if [ ${#REGRESSION_CONTROLS[@]} -gt 0 ]; then
+    REGRESSION_JSON=$(printf '%s\n' "${REGRESSION_CONTROLS[@]}" | \
+      python3 -c "import sys,json; print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))" 2>/dev/null || echo "[]")
+  fi
 
   STATUS="PASS"; [ "$TOTAL_FAIL" -gt 0 ] && STATUS="FAIL"
 
@@ -129,16 +141,17 @@ if [ "$OUTPUT_FORMAT" = "json" ]; then
   "total_pass": $TOTAL_PASS,
   "total_fail": $TOTAL_FAIL,
   "total_controls": $TOTAL,
-  "fail_controls": $FAIL_LIST_JSON,
+  "fail_controls": $FAIL_JSON,
   "regression_controls": $REGRESSION_JSON,
   "domains": [$DOMAINS_JSON]
 }
 EOF
+
   echo ""
   echo "JSON report: $REPORT_FILE"
 
-  # Xuất control_fail_list.json để WF4 dùng
-  echo "$FAIL_LIST_JSON" > /tmp/control_fail_list.json
+  # Lưu fail list để WF4 dùng
+  echo "$FAIL_JSON" > /tmp/control_fail_list.json
 fi
 
 exit $TOTAL_FAIL

@@ -35,7 +35,7 @@ env:
   REGION:          asia-southeast1
   SCRIPTS_DIR:     scripts
   ANSIBLE_DIR:     ansible
-  TF_STATE_BUCKET: tf-state-project-3a51a40b-8c9e-4126-804
+  TF_STATE_BUCKET: tf-state-3a51a40b-8c9e-4126-804
   ALERT_EMAIL:     23521549@gm.uit.edu.vn
 
 jobs:
@@ -65,7 +65,9 @@ jobs:
         run: |
           pip install ansible google-auth 2>/dev/null || true
           ansible-galaxy collection install google.cloud 2>/dev/null || true
-          chmod +x ${{ env.SCRIPTS_DIR }}/recovery/*.sh
+          chmod +x ${{ env.SCRIPTS_DIR }}/recovery/*.sh \
+                   ${{ env.SCRIPTS_DIR }}/cis_full_check.sh \
+                   ${{ env.SCRIPTS_DIR }}/collect_info.sh 2>/dev/null || true
 
       - name: Log recovery trigger
         run: |
@@ -81,8 +83,8 @@ jobs:
           echo "================================================================"
           echo "WF4_START_TIME=$(date +%s)" >> $GITHUB_ENV
 
-      # ── Nhóm G: Check critical issues TRƯỚC (loop detection) ────
-      - name: "[Nhóm G] Critical / Data integrity check"
+      # ── Nhóm G: Check TRƯỚC — phát hiện loop, false positive ────
+      - name: "[Nhóm G] Critical checks — loop detection & state"
         id: group_g
         run: |
           L1_FAIL="${{ inputs.cis_fail_count }}"
@@ -92,38 +94,43 @@ jobs:
           L2_FAIL=$L2_FAIL \
           L3_FAIL=$L3_FAIL \
           TF_STATE_BUCKET=${{ env.TF_STATE_BUCKET }} \
-            ${{ env.SCRIPTS_DIR }}/recovery/group_g.sh
+            ${{ env.SCRIPTS_DIR }}/recovery/group_g.sh 2>&1
           echo "GROUP_G_EXIT=$?" >> $GITHUB_ENV
         continue-on-error: true
 
-      # STOP nếu recovery loop detected
-      - name: "Stop nếu recovery loop"
+      - name: "Stop nếu recovery loop detected"
         if: env.G_LOOP_BLOCKED == 'true'
         run: |
-          echo "🔴 RECOVERY LOOP DETECTED — Dừng tất cả recovery"
-          echo "Xem log và fix thủ công trước khi trigger lại"
+          echo "🔴 RECOVERY LOOP DETECTED — Dừng để tránh vòng lặp vô tận"
+          echo "Xem log và fix thủ công trước khi trigger lại WF4"
           exit 1
 
       # ── Nhóm F: Pipeline errors ──────────────────────────────────
-      - name: "[Nhóm F] Pipeline error recovery"
+      - name: "[Nhóm F] Pipeline error check & recovery"
         run: |
           TF_STATE_BUCKET=${{ env.TF_STATE_BUCKET }} \
           VM_NAME=${{ env.VM_NAME }} \
           VM_ZONE=${{ env.VM_ZONE }} \
           ANSIBLE_FAILED=false \
-            ${{ env.SCRIPTS_DIR }}/recovery/group_f.sh
+            ${{ env.SCRIPTS_DIR }}/recovery/group_f.sh 2>&1
         continue-on-error: true
 
       # ── Pre-recovery CIS check ────────────────────────────────────
       - name: "[Pre-check] CIS check trước recovery"
         run: |
-          chmod +x ${{ env.SCRIPTS_DIR }}/cis_full_check.sh
           cd ${{ env.SCRIPTS_DIR }}
           set +e
-          ./cis_full_check.sh json /tmp/pre_recovery_report.json 2>&1 | tee /tmp/pre_check.txt
+          ./cis_full_check.sh json /tmp/pre_recovery_report.json \
+            2>&1 | tee /tmp/pre_check.txt
           set -e
           echo "PRE_FAIL=$(jq '.total_fail' /tmp/pre_recovery_report.json 2>/dev/null || echo 99)" >> $GITHUB_ENV
           echo "PRE_PASS=$(jq '.total_pass' /tmp/pre_recovery_report.json 2>/dev/null || echo 0)"  >> $GITHUB_ENV
+          # Upload fail list lên GCS để dùng cho các bước sau
+          if [ -f /tmp/control_fail_list.json ]; then
+            gsutil cp /tmp/control_fail_list.json \
+              gs://${{ env.TF_STATE_BUCKET }}/recovery/control_fail_list.json \
+              2>/dev/null || true
+          fi
 
       # ── Nhóm D: Infrastructure errors ───────────────────────────
       - name: "[Nhóm D] Infrastructure error recovery"
@@ -131,7 +138,7 @@ jobs:
         run: |
           ERROR_TYPE="${{ inputs.error_type }}" \
           APPLY_LOG=/tmp/tf_apply.txt \
-            ${{ env.SCRIPTS_DIR }}/recovery/group_d.sh
+            ${{ env.SCRIPTS_DIR }}/recovery/group_d.sh 2>&1
         continue-on-error: true
 
       # ── Nhóm E: Security anomaly ─────────────────────────────────
@@ -141,21 +148,20 @@ jobs:
             gs://${{ env.TF_STATE_BUCKET }}/baseline/iam_baseline_latest.json \
             /tmp/iam_baseline_latest.json 2>/dev/null || true
 
-          chmod +x ${{ env.SCRIPTS_DIR }}/collect_info.sh
           REGION=${{ env.REGION }} \
             ${{ env.SCRIPTS_DIR }}/collect_info.sh /tmp 2>/dev/null || true
 
-          IAM_ANOMALY="${{ env.IAM_ANOMALY || 'false' }}" \
-          DRIFT_DETECTED="${{ env.DRIFT_DETECTED || 'false' }}" \
+          IAM_ANOMALY=false \
+          DRIFT_DETECTED=false \
           IAM_BASELINE=/tmp/iam_baseline_latest.json \
           IAM_CURRENT=/tmp/iam_snapshot.json \
-          DB_USERNAME="${{ secrets.DB_USERNAME }}" \
-          DB_PASSWORD="${{ secrets.DB_PASSWORD }}" \
-          ALLOWED_CLIENT_CIDR="${{ secrets.ALLOWED_CLIENT_CIDR }}" \
-            ${{ env.SCRIPTS_DIR }}/recovery/group_e.sh
+          DB_USERNAME=${{ secrets.DB_USERNAME }} \
+          DB_PASSWORD=${{ secrets.DB_PASSWORD }} \
+          ALLOWED_CLIENT_CIDR=${{ secrets.ALLOWED_CLIENT_CIDR }} \
+            ${{ env.SCRIPTS_DIR }}/recovery/group_e.sh 2>&1
         continue-on-error: true
 
-      # ── Tải fail list ─────────────────────────────────────────────
+      # ── Tải fail list từ GCS ──────────────────────────────────────
       - name: Tải control_fail_list
         run: |
           gsutil cp \
@@ -165,104 +171,97 @@ jobs:
             || echo "FAIL_LIST_LOADED=false" >> $GITHUB_ENV
 
       # ── Nhóm A: CIS auto fix ──────────────────────────────────────
-      - name: "[Nhóm A] gcloud recovery (D1–D6)"
+      - name: "[Nhóm A] gcloud auto recovery (D1–D6)"
         run: |
           DRY_RUN="${{ inputs.dry_run }}" \
           VM_NAME=${{ env.VM_NAME }} \
           VM_ZONE=${{ env.VM_ZONE }} \
           REGION=${{ env.REGION }} \
           FAIL_LIST_FILE=/tmp/control_fail_list.json \
-            ${{ env.SCRIPTS_DIR }}/recovery.sh 2>&1 | tee /tmp/recovery_a_output.txt
+            ${{ env.SCRIPTS_DIR }}/recovery/group_a.sh \
+            2>&1 | tee /tmp/recovery_a_output.txt
         continue-on-error: true
 
       # ── Nhóm B: Ansible CIS 4.1 + 4.2 ───────────────────────────
-      - name: "[Nhóm B] Ansible — VM Service Account"
+      - name: "[Nhóm B] Ansible — VM Service Account (CIS 4.1+4.2)"
         if: ${{ !inputs.dry_run }}
         run: |
-          NEED_ANSIBLE=false
-          if [ -f /tmp/control_fail_list.json ]; then
-            jq -r '.[]' /tmp/control_fail_list.json 2>/dev/null | \
-              grep -qE "^4\.[12]$" && NEED_ANSIBLE=true || true
-          else
-            NEED_ANSIBLE=true
-          fi
-
-          if [ "$NEED_ANSIBLE" = "true" ]; then
-            VM_IP=$(gcloud compute instances describe ${{ env.VM_NAME }} \
-              --zone=${{ env.VM_ZONE }} \
-              --project=${{ env.PROJECT_ID }} \
-              --format="value(networkInterfaces[0].accessConfigs[0].natIP)" \
-              2>/dev/null || echo "")
-
-            if [ -n "$VM_IP" ]; then
-              sed -i "s/benchmark-vm-01/benchmark-vm-01 ansible_host=$VM_IP/" \
-                ${{ env.ANSIBLE_DIR }}/inventory.ini
-              mkdir -p ~/.ssh
-              echo "${{ secrets.VM_SSH_KEY }}" > ~/.ssh/gcp_key
-              chmod 600 ~/.ssh/gcp_key
-              set +e
-              ansible-playbook \
-                -i ${{ env.ANSIBLE_DIR }}/inventory.ini \
-                ${{ env.ANSIBLE_DIR }}/fix_vm_sa.yml \
-                --private-key=~/.ssh/gcp_key \
-                -v 2>&1 | tee /tmp/ansible_output.txt
-              ANSIBLE_EXIT=$?
-              set -e
-              # Nếu Ansible fail → chạy group_f để rollback VM
-              if [ $ANSIBLE_EXIT -ne 0 ]; then
-                echo "ANSIBLE_FAILED=true" >> $GITHUB_ENV
-                ANSIBLE_FAILED=true \
-                VM_NAME=${{ env.VM_NAME }} \
-                VM_ZONE=${{ env.VM_ZONE }} \
-                  ${{ env.SCRIPTS_DIR }}/recovery/group_f.sh
-              fi
-            fi
-          fi
+          VM_NAME=${{ env.VM_NAME }} \
+          VM_ZONE=${{ env.VM_ZONE }} \
+          FAIL_LIST_FILE=/tmp/control_fail_list.json \
+          SSH_KEY_FILE=/tmp/gcp_key \
+            ${{ env.SCRIPTS_DIR }}/recovery/group_b.sh 2>&1 | tee /tmp/recovery_b_output.txt
+        env:
+          VM_SSH_KEY: ${{ secrets.VM_SSH_KEY }}
         continue-on-error: true
 
-      - name: Wait for propagation (120s)
+      # ── Wait propagation — 120s cho Cloud SQL ────────────────────
+      - name: Wait for changes to propagate (120s)
         run: sleep 120
 
-      # ── Phase 4a: Layer 1 — Script ────────────────────────────────
+      # ── Phase 4a: Layer 1 — Script nội bộ ────────────────────────
       - name: "[Layer 1] Post-recovery CIS check"
         run: |
-          chmod +x ${{ env.SCRIPTS_DIR }}/cis_full_check.sh
           cd ${{ env.SCRIPTS_DIR }}
           set +e
-          ./cis_full_check.sh json /tmp/post_recovery_report.json 2>&1 | tee /tmp/post_check.txt
+          ./cis_full_check.sh json /tmp/post_recovery_report.json \
+            2>&1 | tee /tmp/post_check.txt
           set -e
           echo "POST_FAIL=$(jq '.total_fail'      /tmp/post_recovery_report.json 2>/dev/null || echo 99)" >> $GITHUB_ENV
           echo "POST_PASS=$(jq '.total_pass'      /tmp/post_recovery_report.json 2>/dev/null || echo 0)"  >> $GITHUB_ENV
           echo "POST_RATE=$(jq '.compliance_rate' /tmp/post_recovery_report.json 2>/dev/null || echo 0)"  >> $GITHUB_ENV
 
       # ── Phase 4b: Layer 2 — GCP API trực tiếp ────────────────────
-      - name: "[Layer 2] GCP API verification"
+      - name: "[Layer 2] GCP API direct verification"
         run: |
           L2_FAIL=0
+
+          # CIS 4.5 — serial port
           VM_EXISTS=$(gcloud compute instances list \
             --project=${{ env.PROJECT_ID }} \
             --filter="name=${{ env.VM_NAME }}" \
-            --format="value(name)" 2>/dev/null)
+            --format="value(name)" 2>/dev/null || echo "")
           if [ -n "$VM_EXISTS" ]; then
             VM_SERIAL=$(gcloud compute instances describe ${{ env.VM_NAME }} \
-              --zone=${{ env.VM_ZONE }} --project=${{ env.PROJECT_ID }} \
+              --zone=${{ env.VM_ZONE }} \
+              --project=${{ env.PROJECT_ID }} \
               --format="value(metadata.items[serial-port-enable])" 2>/dev/null || echo "")
-            [ "$VM_SERIAL" = "true" ] || [ "$VM_SERIAL" = "1" ] && L2_FAIL=$((L2_FAIL+1)) || true
+            if [ "$VM_SERIAL" = "true" ] || [ "$VM_SERIAL" = "1" ]; then
+              echo "L2_FAIL: CIS 4.5 serial port vẫn bật"
+              L2_FAIL=$((L2_FAIL+1))
+            fi
           fi
+
+          # CIS 5.1 — bucket public
+          gsutil ls -p ${{ env.PROJECT_ID }} 2>/dev/null | while read B; do
+            PUBLIC=$(gsutil iam get "$B" 2>/dev/null | grep -c "allUsers" || echo 0)
+            if [ "${PUBLIC:-0}" -gt 0 ]; then
+              echo "L2_FAIL: CIS 5.1 bucket $B vẫn public"
+              L2_FAIL=$((L2_FAIL+1))
+            fi
+          done
+
+          # CIS 6.4 — SQL SSL
           SQL_INST=$(gcloud sql instances list \
             --project=${{ env.PROJECT_ID }} \
             --filter="databaseVersion~POSTGRES" \
-            --format="value(name)" 2>/dev/null | head -1)
+            --format="value(name)" 2>/dev/null | head -1 || echo "")
           if [ -n "$SQL_INST" ]; then
             SSL_VAL=$(gcloud sql instances describe "$SQL_INST" \
               --project=${{ env.PROJECT_ID }} \
               --format="value(settings.ipConfiguration.requireSsl)" 2>/dev/null || echo "")
-            [ "$SSL_VAL" != "True" ] && L2_FAIL=$((L2_FAIL+1)) || true
+            if [ "$SSL_VAL" != "True" ]; then
+              echo "L2_FAIL: CIS 6.4 requireSsl = $SSL_VAL"
+              L2_FAIL=$((L2_FAIL+1))
+            fi
           fi
-          echo "L2_FAIL=$L2_FAIL" >> $GITHUB_ENV
-          [ "$L2_FAIL" -eq 0 ] && echo "✓ Layer 2 PASS" || echo "⚠ Layer 2 FAIL: $L2_FAIL"
 
-      # ── Phase 4c: Layer 3 — SCC ───────────────────────────────────
+          echo "L2_FAIL=$L2_FAIL" >> $GITHUB_ENV
+          [ "$L2_FAIL" -eq 0 ] \
+            && echo "✓ Layer 2 GCP API PASS" \
+            || echo "⚠ Layer 2 FAIL: $L2_FAIL issue(s)"
+
+      # ── Phase 4c: Layer 3 — Security Command Center ───────────────
       - name: "[Layer 3] Security Command Center"
         run: |
           SCC_ENABLED=$(gcloud services list --enabled \
@@ -277,24 +276,29 @@ jobs:
               --filter="state=ACTIVE AND severity=HIGH" \
               --format="value(category)" 2>/dev/null | grep -c . || echo 0)
             set -e
+            [ "$L3_FAIL" -eq 0 ] \
+              && echo "✓ Layer 3 SCC: no HIGH findings" \
+              || echo "⚠ Layer 3 SCC: $L3_FAIL HIGH finding(s)"
+          else
+            echo "[INFO] SCC chưa enabled — skip Layer 3"
           fi
           echo "L3_FAIL=$L3_FAIL" >> $GITHUB_ENV
-          [ "$L3_FAIL" -eq 0 ] && echo "✓ Layer 3 PASS" || echo "⚠ Layer 3: $L3_FAIL findings"
 
-      # ── Đánh giá 3 lớp + cập nhật Nhóm G ───────────────────────
-      - name: "Đánh giá 3 lớp xác minh"
+      # ── Đánh giá 3 lớp + cập nhật G ─────────────────────────────
+      - name: "Đánh giá kết quả 3 lớp"
         run: |
           POST_FAIL="${{ env.POST_FAIL }}"
           PRE_FAIL="${{ env.PRE_FAIL }}"
           L2_FAIL="${{ env.L2_FAIL }}"
 
           RECOVERY_STATUS="SUCCESS"
-          [ "${POST_FAIL:-99}" -gt 0 ]                            && RECOVERY_STATUS="PARTIAL"
-          [ "${L2_FAIL:-0}" -gt 0 ] && [ "${POST_FAIL:-0}" -eq 0 ] && RECOVERY_STATUS="FALSE_POSITIVE"
+          [ "${POST_FAIL:-99}" -gt 0 ]                                             && RECOVERY_STATUS="PARTIAL"
+          [ "${L2_FAIL:-0}"   -gt 0 ] && [ "${POST_FAIL:-99}" -eq 0 ]             && RECOVERY_STATUS="FALSE_POSITIVE"
           [ "${POST_FAIL:-99}" -ge "${PRE_FAIL:-99}" ] && [ "${PRE_FAIL:-0}" -gt 0 ] && RECOVERY_STATUS="FAILED"
+
           echo "RECOVERY_STATUS=$RECOVERY_STATUS" >> $GITHUB_ENV
 
-          # Cập nhật lại Nhóm G với L2/L3 thực tế
+          # Cập nhật Nhóm G với kết quả thực
           L1_FAIL=$POST_FAIL \
           L2_FAIL=$L2_FAIL \
           L3_FAIL="${{ env.L3_FAIL }}" \
@@ -304,80 +308,76 @@ jobs:
           echo "====================================="
           echo "  PRE  FAIL: $PRE_FAIL"
           echo "  POST FAIL: $POST_FAIL"
+          echo "  POST RATE: ${{ env.POST_RATE }}%"
           echo "  L2 issues: $L2_FAIL"
-          echo "  L3 finding: ${{ env.L3_FAIL }}"
+          echo "  L3 findings: ${{ env.L3_FAIL }}"
           echo "  STATUS: $RECOVERY_STATUS"
           echo "====================================="
 
-      # ── Nhóm C: Manual actions guidance ─────────────────────────
-      - name: "[Nhóm C] Manual actions"
+      # ── Nhóm C: Manual guidance ───────────────────────────────────
+      - name: "[Nhóm C] Manual actions guidance"
         if: env.POST_FAIL != '0'
         run: |
-          echo "================================================================"
-          echo "  NHÓM C — Cần xử lý thủ công"
-          echo "================================================================"
-          FAIL_LIST=""
-          [ -f /tmp/control_fail_list.json ] && \
-            FAIL_LIST=$(jq -r '.[]' /tmp/control_fail_list.json 2>/dev/null || echo "")
+          FAIL_LIST_FILE=/tmp/control_fail_list.json \
+          ALERT_EMAIL=${{ env.ALERT_EMAIL }} \
+          ALLOWED_CLIENT_CIDR=${{ secrets.ALLOWED_CLIENT_CIDR }} \
+            ${{ env.SCRIPTS_DIR }}/recovery/group_c.sh 2>&1
+        continue-on-error: true
 
-          show_if_fail() {
-            local cid="$1"; local msg="$2"
-            if [ -z "$FAIL_LIST" ] || echo "$FAIL_LIST" | grep -qw "$cid"; then
-              echo "  [$cid] $msg"
-            fi
-          }
-          show_if_fail "1.6" "Xóa IAM binding serviceAccountUser ở project level > Console > IAM"
-          show_if_fail "2.3" "Bật Retention Policy + Lock trên log bucket > Console > Storage"
-          show_if_fail "2.4" "Verify Alert Policy cho Ownership Changes đang ENABLED"
-          show_if_fail "3.3" "Bật DNSSEC: sửa vpc.tf > dnssec_config { state='on' } > terraform apply"
-          show_if_fail "3.6" "Xóa SSH rule 0.0.0.0/0 > chỉ cho phép IP cụ thể"
-
-      # ── Nhóm H: SLA + trend check ────────────────────────────────
+      # ── Nhóm H: SLA & trend ──────────────────────────────────────
       - name: "[Nhóm H] SLA & compliance trend"
         run: |
           WF4_START_TIME=${{ env.WF4_START_TIME }} \
           TF_STATE_BUCKET=${{ env.TF_STATE_BUCKET }} \
-            ${{ env.SCRIPTS_DIR }}/recovery/group_h.sh
+            ${{ env.SCRIPTS_DIR }}/recovery/group_h.sh 2>&1
         continue-on-error: true
 
       # ── Reset loop counter nếu SUCCESS ───────────────────────────
-      - name: Reset recovery loop counter nếu SUCCESS
+      - name: Reset recovery loop counter
         if: env.RECOVERY_STATUS == 'SUCCESS'
         run: |
           echo "0" | gsutil cp - \
             gs://${{ env.TF_STATE_BUCKET }}/recovery/loop_counter.txt \
             2>/dev/null && echo "✓ Loop counter reset" || true
 
-      # ── NOTIFY tổng hợp ──────────────────────────────────────────
-      - name: "[Notify] Thông báo tổng hợp tất cả nhóm"
+      # ── Notify tổng hợp ──────────────────────────────────────────
+      - name: "[Notify] Thông báo tổng hợp"
         if: always()
         run: |
-          TF_FAILED="${{ inputs.tf_failed }}" \
-          ERROR_TYPE="${{ inputs.error_type }}" \
-          PRE_FAIL="${{ env.PRE_FAIL }}" \
-          POST_FAIL="${{ env.POST_FAIL }}" \
-          POST_RATE="${{ env.POST_RATE }}" \
-          RECOVERY_STATUS="${{ env.RECOVERY_STATUS }}" \
-          L2_FAIL="${{ env.L2_FAIL }}" \
-          L3_FAIL="${{ env.L3_FAIL }}" \
-          D_ACTION="${{ env.D_ACTION }}" \
-          D_FIXED="${{ env.D_FIXED }}" \
-          E_FIXED="${{ env.E_FIXED }}" \
-          F_FIXED="${{ env.F_FIXED }}" \
-          G_CRITICAL="${{ env.G_CRITICAL }}" \
-          G_LOOP_BLOCKED="${{ env.G_LOOP_BLOCKED }}" \
+          TF_FAILED="${{ inputs.tf_failed }}"           \
+          ERROR_TYPE="${{ inputs.error_type }}"          \
+          PRE_FAIL="${{ env.PRE_FAIL }}"                 \
+          POST_FAIL="${{ env.POST_FAIL }}"               \
+          POST_RATE="${{ env.POST_RATE }}"               \
+          RECOVERY_STATUS="${{ env.RECOVERY_STATUS }}"   \
+          L2_FAIL="${{ env.L2_FAIL }}"                   \
+          L3_FAIL="${{ env.L3_FAIL }}"                   \
+          D_ACTION="${{ env.D_ACTION }}"                 \
+          D_FIXED="${{ env.D_FIXED }}"                   \
+          E_FIXED="${{ env.E_FIXED }}"                   \
+          F_FIXED="${{ env.F_FIXED }}"                   \
+          G_CRITICAL="${{ env.G_CRITICAL }}"             \
+          G_LOOP_BLOCKED="${{ env.G_LOOP_BLOCKED }}"     \
           G_FALSE_POSITIVE="${{ env.G_FALSE_POSITIVE }}" \
-          SLA_BREACHED="${{ env.SLA_BREACHED }}" \
-          WF4_START_TIME="${{ env.WF4_START_TIME }}" \
-          TRIGGER="${{ inputs.trigger }}" \
-          TRIGGER_REASON="${{ inputs.trigger_reason }}" \
-          REPO="${{ github.repository }}" \
-          RUN_ID="${{ github.run_id }}" \
-          ALERT_EMAIL="${{ env.ALERT_EMAIL }}" \
-          TF_STATE_BUCKET="${{ env.TF_STATE_BUCKET }}" \
-            ${{ env.SCRIPTS_DIR }}/recovery/notify.sh
+          SLA_BREACHED="${{ env.SLA_BREACHED }}"         \
+          WF4_START_TIME="${{ env.WF4_START_TIME }}"     \
+          TRIGGER="${{ inputs.trigger }}"                \
+          TRIGGER_REASON="${{ inputs.trigger_reason }}"  \
+          REPO="${{ github.repository }}"                \
+          RUN_ID="${{ github.run_id }}"                  \
+          ALERT_EMAIL="${{ env.ALERT_EMAIL }}"           \
+          TF_STATE_BUCKET="${{ env.TF_STATE_BUCKET }}"   \
+          GMAIL_USER="${{ secrets.GMAIL_USER }}"         \
+          GMAIL_PASS="${{ secrets.GMAIL_APP_PASSWORD }}" \
+            ${{ env.SCRIPTS_DIR }}/recovery/notify.sh 2>&1
 
-      - name: Upload all artifacts
+      - name: "Đọc notify result"
+        if: always()
+        run: |
+          [ -f /tmp/notify_result.txt ] && \
+            cat /tmp/notify_result.txt >> $GITHUB_ENV || true
+
+      - name: Upload recovery artifacts
         uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -386,7 +386,7 @@ jobs:
             /tmp/pre_recovery_report.json
             /tmp/post_recovery_report.json
             /tmp/recovery_a_output.txt
-            /tmp/ansible_output.txt
+            /tmp/recovery_b_output.txt
             /tmp/post_check.txt
             /tmp/notify_email.txt
           retention-days: 30
@@ -394,7 +394,9 @@ jobs:
       - name: Final exit
         if: always()
         run: |
-          STATUS="${{ env.RECOVERY_STATUS }}"
-          SEVERITY="${{ env.SEVERITY }}"
-          echo "Final: STATUS=$STATUS | SEVERITY=$SEVERITY"
+          [ -f /tmp/notify_result.txt ] && \
+            source /tmp/notify_result.txt 2>/dev/null || true
+          STATUS="${RECOVERY_STATUS:-UNKNOWN}"
+          SEV="${SEVERITY:-UNKNOWN}"
+          echo "Final: STATUS=$STATUS | SEVERITY=$SEV"
           [ "$STATUS" = "SUCCESS" ] && exit 0 || exit 1

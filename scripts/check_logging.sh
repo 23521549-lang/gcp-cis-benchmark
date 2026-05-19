@@ -1,21 +1,13 @@
 #!/bin/bash
 # ================================================================
 # CIS GCP Benchmark v4.0.0 — Domain 2: Logging & Monitoring
-# CIS 2.1 — Cloud Audit Logging đủ 3 loại, không exemptedMembers
-# CIS 2.2 — Log Sink export toàn bộ log, không filter
-# CIS 2.3 — Retention Policy + Bucket Lock
-# CIS 2.4 — Alert: Project Ownership Changes
-# CIS 2.12 — Cloud DNS Logging bật cho tất cả VPC
-# CIS 2.13 — Cloud Asset Inventory API bật
+# CIS 2.1 / 2.2 / 2.3 / 2.4 / 2.12 / 2.13
+# FIX: bỏ set -e để script không bị cắt giữa chừng
 # ================================================================
+set -uo pipefail
 
-set -euo pipefail
 PROJECT_ID=$(gcloud config get-value project 2>/dev/null)
-
-if [ -z "$PROJECT_ID" ]; then
-  echo "ERROR: Chưa set project."
-  exit 1
-fi
+[ -z "$PROJECT_ID" ] && echo "ERROR: Chưa set project." && exit 1
 
 GREEN="\033[0;32m"; RED="\033[0;31m"; YELLOW="\033[0;33m"; RESET="\033[0m"
 PASS=0; FAIL=0
@@ -29,9 +21,7 @@ echo "  CIS LOGGING CHECK — PROJECT: $PROJECT_ID"
 echo "================================================================"
 echo ""
 
-# ----------------------------------------------------------------
-# CIS 2.1 — Cloud Audit Logging đủ 3 loại, không exemptedMembers
-# ----------------------------------------------------------------
+# ── CIS 2.1 — Cloud Audit Logging ────────────────────────────────
 echo "[ 2.1 ] Cloud Audit Logging..."
 AUDIT_RESULT=$(gcloud projects get-iam-policy "$PROJECT_ID" \
   --format=json 2>/dev/null | python3 -c "
@@ -39,190 +29,162 @@ import json, sys
 policy = json.load(sys.stdin)
 configs = policy.get('auditConfigs', [])
 issues = []
-found_all_services = False
+found = False
 for c in configs:
     if c.get('service') == 'allServices':
-        found_all_services = True
+        found = True
         types = [x.get('logType') for x in c.get('auditLogConfigs', [])]
-        exempted = c.get('exemptedMembers', [])
-        for required in ['ADMIN_READ', 'DATA_READ', 'DATA_WRITE']:
-            if required not in types:
-                issues.append(f'MISSING_TYPE:{required}')
-        if exempted:
-            issues.append(f'EXEMPTED_MEMBERS:{len(exempted)}')
-if not found_all_services:
-    issues.append('NO_ALL_SERVICES_CONFIG')
+        for r in ['ADMIN_READ','DATA_READ','DATA_WRITE']:
+            if r not in types: issues.append(f'MISSING:{r}')
+        if c.get('exemptedMembers'): issues.append('HAS_EXEMPTED_MEMBERS')
+if not found: issues.append('NO_ALL_SERVICES_CONFIG')
 print('\n'.join(issues))
-")
+" 2>/dev/null || echo "CHECK_ERROR")
 
-if [ -z "$AUDIT_RESULT" ]; then
-  pass "allServices có đủ ADMIN_READ, DATA_READ, DATA_WRITE, không có exemptedMembers"
+if [ "$AUDIT_RESULT" = "CHECK_ERROR" ]; then
+  fail "2.1 Không kiểm tra được audit logging"
+elif [ -z "$AUDIT_RESULT" ]; then
+  pass "2.1 allServices có đủ ADMIN_READ, DATA_READ, DATA_WRITE, không có exemptedMembers"
 else
-  fail "Audit logging vi phạm:"
-  echo "$AUDIT_RESULT" | while read line; do info "$line"; done
+  fail "2.1 Audit logging vi phạm:"
+  echo "$AUDIT_RESULT" | while IFS= read -r line; do info "$line"; done
 fi
 echo ""
 
-# ----------------------------------------------------------------
-# CIS 2.2 — Log Sink không có filter (export toàn bộ log)
-# ----------------------------------------------------------------
+# ── CIS 2.2 — Log Sink không có filter ───────────────────────────
 echo "[ 2.2 ] Log Sink — không có filter..."
-SINK_ISSUES=$(gcloud logging sinks list --project="$PROJECT_ID" \
+SINK_RESULT=$(gcloud logging sinks list --project="$PROJECT_ID" \
   --format=json 2>/dev/null | python3 -c "
 import json, sys
 sinks = json.load(sys.stdin)
-issues = []
 storage_sinks = [s for s in sinks if 'storage.googleapis.com' in s.get('destination','')]
 if not storage_sinks:
-    issues.append('NO_STORAGE_SINK: không tìm thấy Log Sink nào đến Storage Bucket')
+    print('NO_STORAGE_SINK')
 else:
     for s in storage_sinks:
-        name = s.get('name', 'unknown').split('/')[-1]
-        filt = s.get('filter', '').strip()
-        # GCP trả về '(empty filter)' khi không có filter — coi là không có filter
+        name = s.get('name','').split('/')[-1]
+        filt = s.get('filter','').strip()
         if filt and filt != '(empty filter)':
-            issues.append(f'HAS_FILTER: {name} có filter — cần xóa để export toàn bộ log')
+            print(f'HAS_FILTER:{name}')
         else:
-            print(f'OK: {name}')
-for i in issues:
-    print(i)
-")
+            print(f'OK:{name}')
+" 2>/dev/null || echo "CHECK_ERROR")
 
-if echo "$SINK_ISSUES" | grep -q "^OK:"; then
-  pass "Log Sink hợp lệ — không có filter"
-  PROBLEMS=$(echo "$SINK_ISSUES" | grep -v "^OK:" || true)
-  if [ -n "$PROBLEMS" ]; then
-    fail "Một số sink có vấn đề:"
-    echo "$PROBLEMS" | while read line; do info "$line"; done
-  fi
+if [ "$SINK_RESULT" = "CHECK_ERROR" ]; then
+  fail "2.2 Không kiểm tra được log sink"
+elif echo "$SINK_RESULT" | grep -q "^NO_STORAGE_SINK"; then
+  fail "2.2 NO_STORAGE_SINK: không tìm thấy Log Sink nào đến Storage Bucket"
+  info "Fix: gcloud logging sinks create benchmark-log-sink storage.googleapis.com/BUCKET --project=$PROJECT_ID"
+elif echo "$SINK_RESULT" | grep -q "^HAS_FILTER:"; then
+  fail "2.2 Log Sink có filter — cần xóa để export toàn bộ log"
+  echo "$SINK_RESULT" | grep "^HAS_FILTER:" | while IFS= read -r line; do info "$line"; done
 else
-  fail "Log Sink vi phạm:"
-  echo "$SINK_ISSUES" | while read line; do info "$line"; done
+  pass "2.2 Log Sink hợp lệ — không có filter"
 fi
 echo ""
 
-# ----------------------------------------------------------------
-# CIS 2.3 — Retention Policy + Bucket Lock
-# ----------------------------------------------------------------
+# ── CIS 2.3 — Retention Policy + Bucket Lock ─────────────────────
 echo "[ 2.3 ] Retention Policy + Bucket Lock..."
 BUCKET_NAME=$(gcloud logging sinks list --project="$PROJECT_ID" \
   --format="value(destination)" 2>/dev/null | \
   grep "storage.googleapis.com" | head -1 | \
-  sed 's|storage.googleapis.com/||')
+  sed 's|storage.googleapis.com/||' || echo "")
 
 if [ -z "$BUCKET_NAME" ]; then
-  fail "Không xác định được Bucket từ Log Sink"
+  fail "2.3 Không xác định được Bucket từ Log Sink"
 else
-  RETENTION=$(gsutil retention get "gs://$BUCKET_NAME" 2>/dev/null)
+  RETENTION=$(gsutil retention get "gs://$BUCKET_NAME" 2>/dev/null || echo "")
   LOCKED=$(echo "$RETENTION" | grep -i "LOCKED" || true)
   PERIOD=$(echo "$RETENTION" | grep -i "Duration" || true)
-
   if [ -n "$LOCKED" ] && [ -n "$PERIOD" ]; then
-    pass "Bucket '$BUCKET_NAME' có Retention Policy và đã Locked"
+    pass "2.3 Bucket '$BUCKET_NAME' có Retention Policy và đã Locked"
     info "$PERIOD"
   elif [ -z "$PERIOD" ]; then
-    fail "Bucket '$BUCKET_NAME' chưa có Retention Policy"
-    info "Sửa: thêm retention_policy { is_locked=true } trong storage.tf"
+    fail "2.3 Bucket '$BUCKET_NAME' chưa có Retention Policy"
+    info "Fix: gsutil retention set 30d gs://$BUCKET_NAME && gsutil retention lock gs://$BUCKET_NAME"
   else
-    fail "Bucket '$BUCKET_NAME' có Retention Policy nhưng chưa Lock"
-    info "Sửa: đặt is_locked = true trong storage.tf"
+    fail "2.3 Bucket '$BUCKET_NAME' có Retention Policy nhưng chưa Lock"
+    info "Fix: gsutil retention lock gs://$BUCKET_NAME"
   fi
 fi
 echo ""
 
-# ----------------------------------------------------------------
-# CIS 2.4 — Alert Policy cho Project Ownership Changes
-# ----------------------------------------------------------------
+# ── CIS 2.4 — Alert Policy ────────────────────────────────────────
 echo "[ 2.4 ] Alert: Project Ownership Changes..."
 METRIC_NAME=$(gcloud logging metrics list --project="$PROJECT_ID" \
-  --format="value(name)" 2>/dev/null | grep "ownership" | head -1)
+  --format="value(name)" 2>/dev/null | grep -i "ownership" | head -1 || echo "")
 
 if [ -z "$METRIC_NAME" ]; then
-  fail "Không tìm thấy Log Metric cho Ownership Changes"
-  info "Sửa: thêm google_logging_metric 'project_ownership_changes_metric'"
+  fail "2.4 Không tìm thấy Log Metric cho Ownership Changes"
+  info "Fix: thêm google_logging_metric trong logging.tf"
 else
-  pass "Log Metric tồn tại: $METRIC_NAME"
-  TOKEN=$(gcloud auth print-access-token 2>/dev/null)
-  ALERT_CHECK=$(curl -s -H "Authorization: Bearer $TOKEN" \
-    "https://monitoring.googleapis.com/v3/projects/$PROJECT_ID/alertPolicies" \
-    2>/dev/null | python3 -c "
+  TOKEN=$(gcloud auth print-access-token 2>/dev/null || echo "")
+  ALERT_OK=false
+  if [ -n "$TOKEN" ]; then
+    ALERT_CHECK=$(curl -s -H "Authorization: Bearer $TOKEN" \
+      "https://monitoring.googleapis.com/v3/projects/$PROJECT_ID/alertPolicies" \
+      2>/dev/null | python3 -c "
 import json, sys
 data = json.load(sys.stdin)
 for p in data.get('alertPolicies', []):
-    name = p.get('displayName','').lower()
-    if 'ownership' in name:
-        channels = p.get('notificationChannels', [])
+    if 'ownership' in p.get('displayName','').lower():
+        channels = len(p.get('notificationChannels', []))
         enabled = p.get('enabled', False)
-        print(f'FOUND:{p[\"displayName\"]}:channels={len(channels)}:enabled={enabled}')
+        print(f'{channels}|{enabled}')
         break
-" 2>/dev/null)
-
-  if echo "$ALERT_CHECK" | grep -q "^FOUND:"; then
-    CHANNELS=$(echo "$ALERT_CHECK" | grep -oP "channels=\K[0-9]+")
-    ENABLED=$(echo "$ALERT_CHECK" | grep -oP "enabled=\K\w+")
-    if [ "$CHANNELS" -gt 0 ] && [ "$ENABLED" = "True" ]; then
-      pass "Alert Policy có Notification Channel và đang enabled"
-    else
-      fail "Alert Policy tồn tại nhưng: channels=$CHANNELS, enabled=$ENABLED"
-      info "Sửa: thêm notification_channels và đặt enabled=true"
+" 2>/dev/null || echo "")
+    if [ -n "$ALERT_CHECK" ]; then
+      CHANNELS=$(echo "$ALERT_CHECK" | cut -d'|' -f1)
+      ENABLED=$(echo "$ALERT_CHECK" | cut -d'|' -f2)
+      if [ "${CHANNELS:-0}" -gt 0 ] && [ "$ENABLED" = "True" ]; then
+        ALERT_OK=true
+      fi
     fi
-  else
-    fail "Chưa có Alert Policy cho Ownership Changes"
-    info "Sửa: thêm google_monitoring_alert_policy trong logging.tf"
   fi
+  $ALERT_OK && pass "2.4 Alert Policy có Notification Channel và đang enabled" \
+    || fail "2.4 Alert Policy thiếu notification channel hoặc đang disabled"
 fi
 echo ""
 
-# ----------------------------------------------------------------
-# CIS 2.12 — Cloud DNS Logging bật cho tất cả VPC
-# ----------------------------------------------------------------
+# ── CIS 2.12 — Cloud DNS Logging ─────────────────────────────────
 echo "[ 2.12 ] Cloud DNS Logging..."
-TOKEN=$(gcloud auth print-access-token 2>/dev/null)
-DNS_POLICIES=$(curl -s -H "Authorization: Bearer $TOKEN" \
-  "https://dns.googleapis.com/dns/v1/projects/$PROJECT_ID/policies" \
-  2>/dev/null | python3 -c "
+TOKEN=$(gcloud auth print-access-token 2>/dev/null || echo "")
+TOTAL_P=0; LOGGING_P=0
+if [ -n "$TOKEN" ]; then
+  DNS_RESULT=$(curl -s -H "Authorization: Bearer $TOKEN" \
+    "https://dns.googleapis.com/dns/v1/projects/$PROJECT_ID/policies" \
+    2>/dev/null | python3 -c "
 import json, sys
 data = json.load(sys.stdin)
 policies = data.get('policies', [])
-logging_enabled = [p for p in policies if p.get('enableLogging', False)]
-print(f'TOTAL:{len(policies)}:LOGGING:{len(logging_enabled)}')
-for p in logging_enabled:
-    print(f'  OK: {p[\"name\"]}')
-" 2>/dev/null)
+total = len(policies)
+logging = sum(1 for p in policies if p.get('enableLogging', False))
+print(f'{total}|{logging}')
+" 2>/dev/null || echo "0|0")
+  TOTAL_P=$(echo "$DNS_RESULT" | cut -d'|' -f1)
+  LOGGING_P=$(echo "$DNS_RESULT" | cut -d'|' -f2)
+fi
 
-TOTAL=$(echo "$DNS_POLICIES" | head -1 | grep -oP "TOTAL:\K[0-9]+")
-LOGGING=$(echo "$DNS_POLICIES" | head -1 | grep -oP "LOGGING:\K[0-9]+")
-
-if [ "${TOTAL:-0}" -gt 0 ] && [ "${LOGGING:-0}" -gt 0 ] && [ "$TOTAL" -eq "$LOGGING" ]; then
-  pass "Cloud DNS Logging bật cho tất cả $TOTAL DNS policy"
-elif [ "${TOTAL:-0}" -eq 0 ]; then
-  fail "Không có DNS Policy nào — cần tạo policy với enable_logging=true"
-  info "Sửa: thêm google_dns_policy trong vpc.tf"
+if [ "${TOTAL_P:-0}" -gt 0 ] && [ "${TOTAL_P:-0}" -eq "${LOGGING_P:-0}" ]; then
+  pass "2.12 Cloud DNS Logging bật cho tất cả $TOTAL_P DNS policy"
+elif [ "${TOTAL_P:-0}" -eq 0 ]; then
+  fail "2.12 Không có DNS Policy nào — cần tạo policy với enable_logging=true"
 else
-  fail "Chỉ $LOGGING/$TOTAL DNS Policy có logging bật"
-  info "Sửa: bật enable_logging=true trên tất cả DNS policies"
+  fail "2.12 Chỉ ${LOGGING_P:-0}/${TOTAL_P:-0} DNS Policy có logging bật"
 fi
 echo ""
 
-# ----------------------------------------------------------------
-# CIS 2.13 — Cloud Asset Inventory API
-# ----------------------------------------------------------------
+# ── CIS 2.13 — Cloud Asset API ────────────────────────────────────
 echo "[ 2.13 ] Cloud Asset Inventory API..."
 ASSET_STATUS=$(gcloud services list --project="$PROJECT_ID" \
   --filter="name:cloudasset.googleapis.com" \
-  --format="value(state)" 2>/dev/null)
-
-if [ "$ASSET_STATUS" = "ENABLED" ]; then
-  pass "cloudasset.googleapis.com đã bật"
-else
-  fail "cloudasset.googleapis.com chưa bật"
-  info "Sửa: thêm google_project_service 'cloudasset.googleapis.com'"
-fi
+  --format="value(state)" 2>/dev/null || echo "")
+[ "$ASSET_STATUS" = "ENABLED" ] \
+  && pass "2.13 cloudasset.googleapis.com đã bật" \
+  || fail "2.13 cloudasset.googleapis.com chưa bật"
 echo ""
 
-# ----------------------------------------------------------------
-# Tổng kết
-# ----------------------------------------------------------------
+# ── Summary ───────────────────────────────────────────────────────
 TOTAL=$((PASS+FAIL))
 echo "================================================================"
 if [ "$FAIL" -eq 0 ]; then

@@ -1,7 +1,8 @@
 #!/bin/bash
 # ================================================================
 # Nhóm H — Operational / SLA breach
-# SLA violation / Compliance degradation trend
+# H1: SLA breach check
+# H2: Compliance trend analysis
 # ================================================================
 set -uo pipefail
 
@@ -24,45 +25,60 @@ echo ""
 
 # ── H1: SLA breach check ──────────────────────────────────────────
 echo "[ H1 ] Kiểm tra SLA..."
+
 WF4_START_TIME="${WF4_START_TIME:-$(date +%s)}"
 CURRENT_TIME=$(date +%s)
 ELAPSED_MINUTES=$(( (CURRENT_TIME - WF4_START_TIME) / 60 ))
 
-# Xác định severity từ fail list
+# Đọc fail list an toàn — tránh syntax error
 HIGH_COUNT=0
 MED_COUNT=0
+
 if [ -f /tmp/control_fail_list.json ]; then
-  HIGH_CONTROLS="1.5 1.6 2.1 3.1 3.6 3.7 5.1 4.1 4.2 6.4"
-  FAIL_LIST=$(jq -r '.[]' /tmp/control_fail_list.json 2>/dev/null || echo "")
-  for CID in $HIGH_CONTROLS; do
-    echo "$FAIL_LIST" | grep -qw "$CID" && HIGH_COUNT=$((HIGH_COUNT+1)) || true
-  done
-  TOTAL_FAIL=$(echo "$FAIL_LIST" | grep -c . 2>/dev/null || echo 0)
-  MED_COUNT=$((TOTAL_FAIL - HIGH_COUNT))
+  # Dùng python3 để parse an toàn, không dùng jq arithmetic trực tiếp
+  COUNTS=$(python3 -c "
+import json, sys
+try:
+    with open('/tmp/control_fail_list.json') as f:
+        fail_list = json.load(f)
+    high_controls = {'1.5','1.6','2.1','3.1','3.6','3.7','5.1','4.1','4.2','6.4'}
+    high = sum(1 for c in fail_list if str(c) in high_controls)
+    total = len(fail_list)
+    med = total - high
+    print(f'{high}|{max(med,0)}')
+except Exception:
+    print('0|0')
+" 2>/dev/null || echo "0|0")
+
+  HIGH_COUNT=$(echo "$COUNTS" | cut -d'|' -f1)
+  MED_COUNT=$(echo "$COUNTS"  | cut -d'|' -f2)
 fi
 
-SLA_HIGH=10   # phút
-SLA_MED=20    # phút
+SLA_HIGH=10   # phút cho HIGH severity
+SLA_MED=20    # phút cho MEDIUM severity
 
 echo "  Elapsed: ${ELAPSED_MINUTES} phút"
 echo "  HIGH controls FAIL: $HIGH_COUNT (SLA: ${SLA_HIGH} phút)"
 echo "  MEDIUM controls FAIL: $MED_COUNT (SLA: ${SLA_MED} phút)"
 
 SLA_BREACHED=false
+
 if [ "$HIGH_COUNT" -gt 0 ] && [ "$ELAPSED_MINUTES" -gt "$SLA_HIGH" ]; then
-  warn "SLA BREACH: HIGH severity controls chưa fix sau ${ELAPSED_MINUTES} phút (SLA: ${SLA_HIGH} phút)"
+  warn "SLA BREACH: HIGH controls chưa fix sau ${ELAPSED_MINUTES} phút (SLA: ${SLA_HIGH})"
   SLA_BREACHED=true
-  manual "Escalate ngay — HIGH severity controls: $HIGH_COUNT controls chưa được fix"
-  manual "Review WF4 log để xem bottleneck ở bước nào"
+  manual "Escalate ngay — $HIGH_COUNT HIGH controls chưa fix"
+  manual "Review WF4 log tìm bottleneck trong GitHub Actions artifacts"
 fi
+
 if [ "$MED_COUNT" -gt 0 ] && [ "$ELAPSED_MINUTES" -gt "$SLA_MED" ]; then
-  warn "SLA BREACH: MEDIUM severity controls chưa fix sau ${ELAPSED_MINUTES} phút (SLA: ${SLA_MED} phút)"
+  warn "SLA BREACH: MEDIUM controls chưa fix sau ${ELAPSED_MINUTES} phút (SLA: ${SLA_MED})"
   SLA_BREACHED=true
-  manual "Review recovery log — MEDIUM controls: $MED_COUNT controls chưa fix"
+  manual "Review recovery log — $MED_COUNT MEDIUM controls chưa fix"
 fi
 
 [ "$SLA_BREACHED" = "false" ] && fixed "Trong SLA — elapsed: ${ELAPSED_MINUTES} phút"
 echo "SLA_BREACHED=$SLA_BREACHED" >> "${GITHUB_ENV:-/dev/null}" 2>/dev/null || true
+echo ""
 
 # ── H2: Compliance trend analysis ────────────────────────────────
 echo "[ H2 ] Phân tích compliance trend..."
@@ -71,63 +87,76 @@ HISTORY_FILES=$(gsutil ls \
   "gs://${TF_STATE_BUCKET}/compliance_history/" \
   2>/dev/null | sort | tail -10 || echo "")
 
-if [ -n "$HISTORY_FILES" ]; then
-  TREND_DATA=$(echo "$HISTORY_FILES" | while read F; do
-    gsutil cat "$F" 2>/dev/null | \
-      python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('compliance_rate',0))" \
-      2>/dev/null || echo "0"
-  done)
-
-  RATES=($TREND_DATA)
-  COUNT=${#RATES[@]}
-
-  if [ "$COUNT" -ge 3 ]; then
-    # Tính trend đơn giản: so sánh nửa đầu với nửa sau
-    HALF=$((COUNT/2))
-    FIRST_HALF_SUM=0
-    SECOND_HALF_SUM=0
-
-    for i in "${!RATES[@]}"; do
-      if [ "$i" -lt "$HALF" ]; then
-        FIRST_HALF_SUM=$((FIRST_HALF_SUM + ${RATES[$i]%.*}))
-      else
-        SECOND_HALF_SUM=$((SECOND_HALF_SUM + ${RATES[$i]%.*}))
-      fi
-    done
-
-    FIRST_AVG=$((FIRST_HALF_SUM / HALF))
-    SECOND_AVG=$((SECOND_HALF_SUM / (COUNT - HALF)))
-    DIFF=$((SECOND_AVG - FIRST_AVG))
-
-    echo "  Trend: ${FIRST_AVG}% → ${SECOND_AVG}% (${DIFF:+}${DIFF}%)"
-    echo "  Recent rates: ${RATES[*]}"
-
-    if [ "$DIFF" -lt -5 ]; then
-      warn "DEGRADATION TREND: Compliance giảm ${DIFF}% trong ${COUNT} lần check gần nhất"
-      manual "Review lịch sử: gs://${TF_STATE_BUCKET}/compliance_history/"
-      manual "Kiểm tra có thay đổi infrastructure hoặc policy nào gần đây không"
-      manual "Xem xét tăng tần suất WF2 từ 6h lên 1h tạm thời"
-    elif [ "$DIFF" -lt 0 ]; then
-      warn "Nhẹ: Compliance giảm nhẹ ${DIFF}% — theo dõi thêm"
-    else
-      fixed "Trend ổn định hoặc tăng (+${DIFF}%)"
-    fi
-  else
-    echo "  Chưa đủ dữ liệu lịch sử ($COUNT records) — cần ít nhất 3 lần WF2 chạy"
-  fi
-else
+if [ -z "$HISTORY_FILES" ]; then
   echo "  Chưa có compliance history — WF2 chưa chạy lần nào"
   manual "Để WF2 tự chạy theo lịch hoặc trigger thủ công"
-fi
+else
+  # Thu thập rates
+  RATES=""
+  while IFS= read -r F; do
+    [ -z "$F" ] && continue
+    RATE=$(gsutil cat "$F" 2>/dev/null | \
+      python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    print(int(d.get('compliance_rate', 0)))
+except:
+    print(0)
+" 2>/dev/null || echo "0")
+    RATES="${RATES} ${RATE}"
+  done <<< "$HISTORY_FILES"
 
-# ── Xuất kết quả ─────────────────────────────────────────────────
+  RATES_TRIM=$(echo "$RATES" | xargs)
+  COUNT=$(echo "$RATES_TRIM" | wc -w | tr -d ' ')
+  echo "  History records: $COUNT"
+  echo "  Recent rates: $RATES_TRIM"
+
+  if [ "$COUNT" -ge 3 ]; then
+    TREND=$(python3 -c "
+rates = [int(x) for x in '$RATES_TRIM'.split() if x.strip().isdigit()]
+if len(rates) < 3:
+    print('0|0|0')
+    exit()
+half = len(rates) // 2
+first_avg = sum(rates[:half]) // max(half, 1)
+second_avg = sum(rates[half:]) // max(len(rates) - half, 1)
+diff = second_avg - first_avg
+print(f'{first_avg}|{second_avg}|{diff}')
+" 2>/dev/null || echo "0|0|0")
+
+    FIRST_AVG=$(echo "$TREND" | cut -d'|' -f1)
+    SECOND_AVG=$(echo "$TREND" | cut -d'|' -f2)
+    DIFF=$(echo "$TREND" | cut -d'|' -f3)
+    echo "  Trend: ${FIRST_AVG}% → ${SECOND_AVG}% (${DIFF:+}${DIFF}%)"
+
+    if [ "${DIFF:-0}" -lt -5 ]; then
+      warn "DEGRADATION TREND: Compliance giảm ${DIFF}% trong lịch sử gần đây"
+      manual "Kiểm tra lịch sử: gs://${TF_STATE_BUCKET}/compliance_history/"
+      manual "Review infrastructure thay đổi gần đây"
+      manual "Cân nhắc tăng tần suất WF2 lên mỗi 1 giờ tạm thời"
+    elif [ "${DIFF:-0}" -lt 0 ]; then
+      warn "Compliance giảm nhẹ ${DIFF}% — cần theo dõi thêm"
+    else
+      fixed "Compliance trend ổn định hoặc tăng (+${DIFF}%)"
+    fi
+  else
+    echo "  Chưa đủ dữ liệu ($COUNT records) — cần ít nhất 3 lần WF2 chạy"
+  fi
+fi
 echo ""
+
+# ── Summary ───────────────────────────────────────────────────────
 echo "================================================================"
 echo "  Nhóm H Summary"
-echo "  H_FIXED: $H_FIXED"
+echo "  H_FIXED      : $H_FIXED"
+echo "  SLA_BREACHED : $SLA_BREACHED"
 [ -n "$H_MANUAL_STEPS" ] && echo -e "  Manual steps:$H_MANUAL_STEPS"
 echo "================================================================"
 
-echo "H_FIXED=$H_FIXED"         >> "${GITHUB_ENV:-/dev/null}" 2>/dev/null || true
-echo "H_MANUAL=$H_MANUAL_STEPS" >> "${GITHUB_ENV:-/dev/null}" 2>/dev/null || true
+{
+  echo "H_FIXED=$H_FIXED"
+  echo "SLA_BREACHED=$SLA_BREACHED"
+} >> "${GITHUB_ENV:-/dev/null}" 2>/dev/null || true
+
 exit 0

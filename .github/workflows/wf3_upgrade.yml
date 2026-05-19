@@ -15,7 +15,8 @@ env:
   TF_DIR:          terraform
   SCRIPTS_DIR:     scripts
   REGION:          asia-southeast1
-  TF_STATE_BUCKET: tf-state-project-3a51a40b-8c9e-4126-804
+  VM_ZONE:         asia-southeast1-a
+  TF_STATE_BUCKET: tf-state-3a51a40b-8c9e-4126-804
   ALERT_EMAIL:     23521549@gm.uit.edu.vn
 
 jobs:
@@ -40,16 +41,15 @@ jobs:
         id: detect
         run: |
           CHANGED=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || echo "terraform/")
-          echo "Changed files: $CHANGED"
-
+          echo "Changed: $CHANGED"
           IAM=false; LOGGING=false; NET=false; VM=false; STORAGE=false; SQL=false
 
           echo "$CHANGED" | grep -q "security_iam\|security_kms\|security_apikey" && IAM=true
-          echo "$CHANGED" | grep -q "logging"                                       && LOGGING=true
-          echo "$CHANGED" | grep -q "vpc\|networking"                               && NET=true
-          echo "$CHANGED" | grep -q "vm\|compute"                                   && VM=true
-          echo "$CHANGED" | grep -q "storage"                                       && STORAGE=true
-          echo "$CHANGED" | grep -q "db\.tf"                                        && SQL=true
+          echo "$CHANGED" | grep -q "logging"    && LOGGING=true
+          echo "$CHANGED" | grep -q "vpc\|networking" && NET=true
+          echo "$CHANGED" | grep -q "vm\|compute" && VM=true
+          echo "$CHANGED" | grep -q "storage"    && STORAGE=true
+          echo "$CHANGED" | grep -q "db\.tf"     && SQL=true
 
           if echo "$CHANGED" | grep -q "provider\|variables\|outputs"; then
             IAM=true; LOGGING=true; NET=true; VM=true; STORAGE=true; SQL=true
@@ -71,6 +71,7 @@ jobs:
       contents: read
       id-token: write
       pull-requests: write
+      actions: write
 
     steps:
       - name: Checkout
@@ -101,16 +102,7 @@ jobs:
             -out=tfplan -no-color 2>&1 | tee /tmp/tf_plan.txt
           PLAN_EXIT=$?
           set -e
-
-          echo "PLAN_EXIT=$PLAN_EXIT" >> $GITHUB_ENV
-
-          if [ $PLAN_EXIT -ne 0 ]; then
-            echo "PLAN_FAILED=true" >> $GITHUB_ENV
-            echo "⚠ Terraform Plan FAILED"
-          else
-            echo "PLAN_FAILED=false" >> $GITHUB_ENV
-            echo "✓ Terraform Plan OK"
-          fi
+          echo "PLAN_FAILED=$([ $PLAN_EXIT -ne 0 ] && echo true || echo false)" >> $GITHUB_ENV
 
       - name: Comment plan on PR
         if: github.event_name == 'pull_request'
@@ -119,37 +111,26 @@ jobs:
           script: |
             const fs = require('fs');
             const plan = fs.readFileSync('/tmp/tf_plan.txt', 'utf8');
-            const truncated = plan.length > 60000
-              ? plan.substring(0, 60000) + '\n... (truncated)'
-              : plan;
-            const planFailed = process.env.PLAN_FAILED === 'true';
-            const header = planFailed
-              ? '## ❌ Terraform Plan FAILED'
-              : '## ✅ Terraform Plan';
+            const truncated = plan.length > 60000 ? plan.substring(0,60000)+'...(truncated)' : plan;
+            const failed = process.env.PLAN_FAILED === 'true';
             await github.rest.issues.createComment({
-              owner:        context.repo.owner,
-              repo:         context.repo.repo,
+              owner: context.repo.owner, repo: context.repo.repo,
               issue_number: context.issue.number,
-              body:         `${header}\n\`\`\`\n${truncated}\n\`\`\``
+              body: `## ${failed ? '❌' : '✅'} Terraform Plan\n\`\`\`\n${truncated}\n\`\`\``
             });
 
-      # Trigger WF4 nếu Plan thất bại trên PR
-      - name: "Trigger WF4 nếu Plan FAIL"
-        if: env.PLAN_FAILED == 'true' && github.event_name == 'pull_request'
+      - name: Trigger WF4 nếu Plan FAIL
+        if: env.PLAN_FAILED == 'true'
         uses: actions/github-script@v7
         with:
           script: |
             await github.rest.actions.createWorkflowDispatch({
-              owner:       context.repo.owner,
-              repo:        context.repo.repo,
-              workflow_id: 'wf4_recovery.yml',
-              ref:         'main',
+              owner: context.repo.owner, repo: context.repo.repo,
+              workflow_id: 'wf4_recovery.yml', ref: 'main',
               inputs: {
-                trigger:        'WF3_PLAN_FAIL',
-                cis_fail_count: '0',
-                tf_failed:      'true',
-                error_type:     'TF_UNKNOWN',
-                trigger_reason: 'WF3_plan_failed_on_PR',
+                trigger: 'WF3_PLAN_FAIL', cis_fail_count: '0',
+                tf_failed: 'true', error_type: 'TF_UNKNOWN',
+                trigger_reason: 'WF3_terraform_plan_failed',
               }
             });
 
@@ -182,11 +163,60 @@ jobs:
         with:
           terraform_version: "~> 1.7"
 
-      - name: Terraform Init & Apply
+      - name: "Auto-import existing resources"
         working-directory: ${{ env.TF_DIR }}
         run: |
           terraform init -upgrade
 
+          import_if_missing() {
+            local resource="$1" gcp_id="$2" desc="$3"
+            terraform state show "$resource" &>/dev/null 2>&1 \
+              && echo "  [SKIP] $desc" \
+              || { echo "  [IMPORT] $desc..."; terraform import "$resource" "$gcp_id" 2>&1 || true; }
+          }
+
+          PROJECT=${{ env.PROJECT_ID }}
+          REGION=${{ env.REGION }}
+          ZONE=${{ env.VM_ZONE }}
+
+          import_if_missing "google_kms_key_ring.my_keyring" \
+            "projects/${PROJECT}/locations/${REGION}/keyRings/benchmark-keyring" "KMS KeyRing"
+          import_if_missing "google_kms_crypto_key.my_crypto_key" \
+            "projects/${PROJECT}/locations/${REGION}/keyRings/benchmark-keyring/cryptoKeys/benchmark-crypto-key" "KMS Key"
+
+          for BNAME in "benchmark-storage-v2-${PROJECT}" "benchmark-storage-${PROJECT}" \
+                       "benchmark-storage-3a51a40b-8c9e-4126-804" \
+                       "benchmark-storage-v2-3a51a40b-8c9e-4126-804"; do
+            gsutil ls "gs://${BNAME}" &>/dev/null 2>&1 && {
+              import_if_missing "google_storage_bucket.log_bucket" "$BNAME" "Storage bucket: $BNAME"
+              break
+            } || true
+          done
+
+          API_KEY=$(gcloud alpha services api-keys list --project="$PROJECT" \
+            --format="value(name)" --filter="displayName:Restricted" 2>/dev/null | head -1 || echo "")
+          [ -n "$API_KEY" ] && import_if_missing "google_apikeys_key.restricted_api_key" "$API_KEY" "API Key"
+
+          SINK=$(gcloud logging sinks list --project="$PROJECT" \
+            --filter="name=benchmark-log-sink" --format="value(name)" 2>/dev/null || echo "")
+          [ -n "$SINK" ] && import_if_missing "google_logging_project_sink.log_sink" \
+            "projects/${PROJECT}/sinks/benchmark-log-sink" "Log Sink"
+
+          VM=$(gcloud compute instances describe benchmark-vm-01 \
+            --zone="$ZONE" --project="$PROJECT" --format="value(name)" 2>/dev/null || echo "")
+          [ -n "$VM" ] && import_if_missing "google_compute_instance.vm" \
+            "projects/${PROJECT}/zones/${ZONE}/instances/benchmark-vm-01" "VM"
+
+          gcloud iam service-accounts add-iam-policy-binding \
+            "app-least-privilege-sa@${PROJECT}.iam.gserviceaccount.com" \
+            --member="serviceAccount:github-actions-sa@${PROJECT}.iam.gserviceaccount.com" \
+            --role="roles/iam.serviceAccountUser" \
+            --project="$PROJECT" --quiet 2>/dev/null || true
+        continue-on-error: true
+
+      - name: Terraform Apply
+        working-directory: ${{ env.TF_DIR }}
+        run: |
           set +e
           terraform apply -auto-approve \
             -var="db_username=${{ secrets.DB_USERNAME }}" \
@@ -196,131 +226,110 @@ jobs:
           APPLY_EXIT=$?
           set -e
 
-          echo "APPLY_EXIT=$APPLY_EXIT" >> $GITHUB_ENV
-
           if [ $APPLY_EXIT -ne 0 ]; then
             echo "TF_FAILED=true" >> $GITHUB_ENV
-
             ERROR_TYPE="TF_UNKNOWN"
-            if grep -qiE "already exists|conflict|409" /tmp/tf_apply.txt; then
-              ERROR_TYPE="TF_CONFLICT"
-            fi
-            if grep -qiE "does not have access|permission denied|403|serviceAccountUser|PERMISSION_DENIED" /tmp/tf_apply.txt; then
-              ERROR_TYPE="TF_PERMISSION"
-            fi
-            if grep -qiE "quota|RESOURCE_EXHAUSTED|429" /tmp/tf_apply.txt; then
-              ERROR_TYPE="TF_QUOTA"
-            fi
-            if grep -qiE "timeout|deadline exceeded" /tmp/tf_apply.txt; then
-              ERROR_TYPE="TF_TIMEOUT"
-            fi
-
+            grep -qiE "already exists|conflict|409"              /tmp/tf_apply.txt && ERROR_TYPE="TF_CONFLICT"
+            grep -qiE "serviceAccountUser|PERMISSION_DENIED|403" /tmp/tf_apply.txt \
+              && ERROR_TYPE="${ERROR_TYPE},TF_PERMISSION"
+            grep -qiE "quota|RESOURCE_EXHAUSTED"                 /tmp/tf_apply.txt && ERROR_TYPE="TF_QUOTA"
             echo "TF_ERROR_TYPE=$ERROR_TYPE" >> $GITHUB_ENV
-            echo "⚠ Terraform Apply FAILED — Error type: $ERROR_TYPE"
-            tail -20 /tmp/tf_apply.txt
+            echo "⚠ Apply FAILED: $ERROR_TYPE"
           else
             echo "TF_FAILED=false"    >> $GITHUB_ENV
             echo "TF_ERROR_TYPE=NONE" >> $GITHUB_ENV
-            echo "✓ Terraform Apply SUCCESS"
+            echo "✓ Apply SUCCESS"
           fi
         continue-on-error: true
 
       - name: Wait for propagation
         run: sleep 30
 
-      # ── Verify các domain bị ảnh hưởng ────────────────────────
-      - name: "[Verify] IAM domain"
+      - name: "[Verify] IAM"
         if: needs.detect-affected-domains.outputs.check_iam == 'true'
         run: |
           chmod +x ${{ env.SCRIPTS_DIR }}/check_iam.sh
-          set +e
-          ${{ env.SCRIPTS_DIR }}/check_iam.sh 2>&1 | tee /tmp/verify_iam.txt
-          set -e
+          set +e; ${{ env.SCRIPTS_DIR }}/check_iam.sh 2>&1 | tee /tmp/verify_iam.txt; set -e
+        continue-on-error: true
 
-      - name: "[Verify] Logging domain"
+      - name: "[Verify] Logging"
         if: needs.detect-affected-domains.outputs.check_logging == 'true'
         run: |
           chmod +x ${{ env.SCRIPTS_DIR }}/check_logging.sh
-          set +e
-          ${{ env.SCRIPTS_DIR }}/check_logging.sh 2>&1 | tee /tmp/verify_logging.txt
-          set -e
+          set +e; ${{ env.SCRIPTS_DIR }}/check_logging.sh 2>&1 | tee /tmp/verify_logging.txt; set -e
+        continue-on-error: true
 
-      - name: "[Verify] Networking domain"
+      - name: "[Verify] Networking"
         if: needs.detect-affected-domains.outputs.check_networking == 'true'
         run: |
           chmod +x ${{ env.SCRIPTS_DIR }}/check_networking.sh
-          set +e
-          ${{ env.SCRIPTS_DIR }}/check_networking.sh 2>&1 | tee /tmp/verify_net.txt
-          set -e
+          set +e; ${{ env.SCRIPTS_DIR }}/check_networking.sh 2>&1 | tee /tmp/verify_net.txt; set -e
+        continue-on-error: true
 
-      - name: "[Verify] VM domain"
+      - name: "[Verify] VM"
         if: needs.detect-affected-domains.outputs.check_vm == 'true'
         run: |
           chmod +x ${{ env.SCRIPTS_DIR }}/check_vm.sh
-          set +e
-          ${{ env.SCRIPTS_DIR }}/check_vm.sh 2>&1 | tee /tmp/verify_vm.txt
-          set -e
+          set +e; ${{ env.SCRIPTS_DIR }}/check_vm.sh 2>&1 | tee /tmp/verify_vm.txt; set -e
+        continue-on-error: true
 
-      - name: "[Verify] Storage domain"
+      - name: "[Verify] Storage"
         if: needs.detect-affected-domains.outputs.check_storage == 'true'
         run: |
           chmod +x ${{ env.SCRIPTS_DIR }}/check_storage.sh
-          set +e
-          ${{ env.SCRIPTS_DIR }}/check_storage.sh 2>&1 | tee /tmp/verify_storage.txt
-          set -e
+          set +e; ${{ env.SCRIPTS_DIR }}/check_storage.sh 2>&1 | tee /tmp/verify_storage.txt; set -e
+        continue-on-error: true
 
-      - name: "[Verify] Cloud SQL domain"
+      - name: "[Verify] Cloud SQL"
         if: needs.detect-affected-domains.outputs.check_sql == 'true'
         run: |
           chmod +x ${{ env.SCRIPTS_DIR }}/check_sql.sh
-          set +e
-          ${{ env.SCRIPTS_DIR }}/check_sql.sh 2>&1 | tee /tmp/verify_sql.txt
-          set -e
+          set +e; ${{ env.SCRIPTS_DIR }}/check_sql.sh 2>&1 | tee /tmp/verify_sql.txt; set -e
+        continue-on-error: true
 
-      # ── Tổng hợp kết quả verify ────────────────────────────────
-      - name: "Tổng hợp kết quả verify"
+      - name: "Tổng hợp kết quả"
         run: |
           VERIFY_FAIL=0
-          VERIFY_DETAIL=""
-
           for f in /tmp/verify_*.txt; do
-            if [ -f "$f" ]; then
-              COUNT=$(grep -c "\[FAIL\]" "$f" 2>/dev/null || echo 0)
-              if [ "$COUNT" -gt 0 ]; then
-                VERIFY_FAIL=$((VERIFY_FAIL + COUNT))
-                DOMAIN=$(basename "$f" .txt | sed 's/verify_//')
-                VERIFY_DETAIL="${VERIFY_DETAIL}${DOMAIN}:${COUNT}FAIL "
-              fi
-            fi
+            [ -f "$f" ] && COUNT=$(grep -c "\[FAIL\]" "$f" 2>/dev/null || true) || COUNT=0
+            VERIFY_FAIL=$((VERIFY_FAIL + COUNT))
           done
+          echo "VERIFY_FAIL=$VERIFY_FAIL" >> $GITHUB_ENV
 
-          echo "VERIFY_FAIL=$VERIFY_FAIL"     >> $GITHUB_ENV
-          echo "VERIFY_DETAIL=$VERIFY_DETAIL" >> $GITHUB_ENV
-
+          # Full CIS check để phát hiện FAIL ngoài domain verify
+          CIS_FAIL_FULL=0
+          CIS_RATE_WF3=100
           if [ "$VERIFY_FAIL" -eq 0 ] && [ "${{ env.TF_FAILED }}" != "true" ]; then
-            echo "✓ Tất cả domain verify PASS"
-          else
-            echo "⚠ FAIL — TF: ${{ env.TF_FAILED }} | CIS verify: $VERIFY_FAIL ($VERIFY_DETAIL)"
+            chmod +x ${{ env.SCRIPTS_DIR }}/cis_full_check.sh
+            cd ${{ env.SCRIPTS_DIR }}
+            set +e
+            ./cis_full_check.sh json /tmp/cis_report_wf3.json 2>&1
+            set -e
+            cd ..
+            if [ -f /tmp/cis_report_wf3.json ]; then
+              CIS_FAIL_FULL=$(jq '.total_fail'      /tmp/cis_report_wf3.json 2>/dev/null || echo 0)
+              CIS_RATE_WF3=$(jq '.compliance_rate'  /tmp/cis_report_wf3.json 2>/dev/null || echo 100)
+            fi
           fi
+          echo "CIS_FAIL_FULL=$CIS_FAIL_FULL" >> $GITHUB_ENV
+          echo "CIS_RATE_WF3=$CIS_RATE_WF3"   >> $GITHUB_ENV
 
-      # ── Phase 1: Cập nhật baseline nếu OK ─────────────────────
-      - name: "[Phase 1] Cập nhật baseline sau upgrade thành công"
-        if: env.VERIFY_FAIL == '0' && env.TF_FAILED == 'false'
+          echo "================================"
+          echo "  TF_FAILED   : ${{ env.TF_FAILED }}"
+          echo "  VERIFY_FAIL : $VERIFY_FAIL"
+          echo "  CIS_FAIL    : $CIS_FAIL_FULL"
+          echo "  CIS_RATE    : $CIS_RATE_WF3%"
+          echo "================================"
+
+      - name: "[Phase 1] Update baseline nếu 100% PASS"
+        if: env.VERIFY_FAIL == '0' && env.TF_FAILED == 'false' && env.CIS_FAIL_FULL == '0'
         env:
           TF_STATE_BUCKET: ${{ env.TF_STATE_BUCKET }}
         run: |
-          chmod +x ${{ env.SCRIPTS_DIR }}/cis_full_check.sh
-          cd ${{ env.SCRIPTS_DIR }}
-
-          set +e
-          ./cis_full_check.sh json /tmp/cis_report_wf3.json 2>&1
-          set -e
-
-          cd ..
           chmod +x ${{ env.SCRIPTS_DIR }}/baseline/init_baseline.sh
           ${{ env.SCRIPTS_DIR }}/baseline/init_baseline.sh \
             /tmp/cis_report_wf3.json WF3 /tmp/context_info.json || true
-          echo "✓ Baseline updated after WF3 upgrade"
+          echo "✓ Baseline updated after WF3"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -333,69 +342,57 @@ jobs:
             /tmp/cis_report_wf3.json
           retention-days: 30
 
-      # ── Quyết định trigger WF4 ──────────────────────────────────
       - name: "Quyết định trigger WF4"
         if: always()
         run: |
           TRIGGER_WF4=false
           TRIGGER_REASON=""
-          ERROR_TYPE="${{ env.TF_ERROR_TYPE }}"
           TF_FAILED="${{ env.TF_FAILED }}"
+          ERROR_TYPE="${{ env.TF_ERROR_TYPE }}"
 
-          # Terraform apply lỗi
-          if [ "$TF_FAILED" = "true" ]; then
+          [ "$TF_FAILED" = "true" ] && {
             TRIGGER_WF4=true
             TRIGGER_REASON="WF3_TF_ERROR:${ERROR_TYPE}"
-          fi
+          }
 
-          # CIS verify lỗi sau apply
-          VERIFY_FAIL="${{ env.VERIFY_FAIL }}"
-          if [ "${VERIFY_FAIL:-0}" -gt 0 ]; then
+          [ "${VERIFY_FAIL:-0}" -gt 0 ] && {
             TRIGGER_WF4=true
-            TRIGGER_REASON="${TRIGGER_REASON:+$TRIGGER_REASON,}WF3_VERIFY_FAIL:${VERIFY_FAIL}controls"
-            # Nếu chỉ có CIS fail thì không phải TF error
-            if [ "$TF_FAILED" != "true" ]; then
-              TF_FAILED="false"
-              ERROR_TYPE="NONE"
+            TRIGGER_REASON="${TRIGGER_REASON:+$TRIGGER_REASON,}WF3_VERIFY_FAIL:${{ env.VERIFY_FAIL }}"
+          }
+
+          [ "${CIS_FAIL_FULL:-0}" -gt 0 ] && {
+            TRIGGER_WF4=true
+            TRIGGER_REASON="${TRIGGER_REASON:+$TRIGGER_REASON,}WF3_CIS_FAIL:${{ env.CIS_FAIL_FULL }}(rate:${{ env.CIS_RATE_WF3 }}%)"
+            # Upload fail list cho WF4
+            if [ -f /tmp/control_fail_list.json ]; then
+              gsutil cp /tmp/control_fail_list.json \
+                gs://${{ env.TF_STATE_BUCKET }}/recovery/control_fail_list.json \
+                2>/dev/null || true
             fi
-          fi
+          }
 
           echo "TRIGGER_WF4=$TRIGGER_WF4"       >> $GITHUB_ENV
           echo "TRIGGER_REASON=$TRIGGER_REASON" >> $GITHUB_ENV
-
-          echo "================================"
           echo "  TRIGGER_WF4 : $TRIGGER_WF4"
           echo "  REASON      : $TRIGGER_REASON"
-          echo "  TF_FAILED   : $TF_FAILED"
-          echo "  VERIFY_FAIL : ${{ env.VERIFY_FAIL }}"
-          echo "================================"
 
       - name: "Trigger WF4 Recovery"
         if: always() && env.TRIGGER_WF4 == 'true'
         uses: actions/github-script@v7
         with:
           script: |
-            const tfFailed    = process.env.TF_FAILED      || 'false';
-            const errorType   = process.env.TF_ERROR_TYPE  || 'NONE';
-            const verifyFail  = process.env.VERIFY_FAIL    || '0';
-            const reason      = process.env.TRIGGER_REASON || 'WF3';
-
-            console.log(`Triggering WF4 — reason: ${reason}`);
-
             await github.rest.actions.createWorkflowDispatch({
-              owner:       context.repo.owner,
-              repo:        context.repo.repo,
-              workflow_id: 'wf4_recovery.yml',
-              ref:         'main',
+              owner: context.repo.owner, repo: context.repo.repo,
+              workflow_id: 'wf4_recovery.yml', ref: 'main',
               inputs: {
                 trigger:        'WF3',
-                cis_fail_count: verifyFail,
-                tf_failed:      tfFailed,
-                error_type:     errorType,
-                trigger_reason: reason,
+                cis_fail_count: process.env.CIS_FAIL_FULL  || '0',
+                tf_failed:      process.env.TF_FAILED       || 'false',
+                error_type:     process.env.TF_ERROR_TYPE   || 'NONE',
+                trigger_reason: process.env.TRIGGER_REASON  || 'WF3',
               }
             });
-            console.log('WF4 dispatched successfully');
+            console.log('WF4 triggered:', process.env.TRIGGER_REASON);
 
       - name: Summary
         if: always()
@@ -405,7 +402,8 @@ jobs:
           echo "  TF_FAILED   : ${{ env.TF_FAILED }}"
           echo "  TF_ERROR    : ${{ env.TF_ERROR_TYPE }}"
           echo "  VERIFY_FAIL : ${{ env.VERIFY_FAIL }}"
-          echo "  VERIFY_DTL  : ${{ env.VERIFY_DETAIL }}"
+          echo "  CIS_FAIL    : ${{ env.CIS_FAIL_FULL }}"
+          echo "  CIS_RATE    : ${{ env.CIS_RATE_WF3 }}%"
           echo "  WF4 TRIGGER : ${{ env.TRIGGER_WF4 }}"
           echo "  REASON      : ${{ env.TRIGGER_REASON }}"
           echo "================================================"

@@ -13,7 +13,9 @@ env:
   TF_DIR:          terraform
   SCRIPTS_DIR:     scripts
   REGION:          asia-southeast1
-  TF_STATE_BUCKET: tf-state-project-3a51a40b-8c9e-4126-804
+  VM_ZONE:         asia-southeast1-a
+  TF_STATE_BUCKET: tf-state-3a51a40b-8c9e-4126-804
+  ALERT_EMAIL:     23521549@gm.uit.edu.vn
 
 jobs:
   deploy:
@@ -39,14 +41,12 @@ jobs:
         with:
           project_id: ${{ env.PROJECT_ID }}
 
-      # ── Phase 0: Thu thập thông tin ────────────────────────────
       - name: "[Phase 0] Thu thập thông tin hệ thống"
         run: |
           chmod +x ${{ env.SCRIPTS_DIR }}/collect_info.sh
           REGION=${{ env.REGION }} \
-            ${{ env.SCRIPTS_DIR }}/collect_info.sh /tmp
-          echo "=== Context Info ==="
-          cat /tmp/context_info.json
+            ${{ env.SCRIPTS_DIR }}/collect_info.sh /tmp || true
+          echo "=== Context Info ===" && cat /tmp/context_info.json 2>/dev/null || true
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
@@ -64,58 +64,136 @@ jobs:
       - name: Terraform Plan
         working-directory: ${{ env.TF_DIR }}
         run: |
+          set +e
           terraform plan \
             -var="db_username=${{ secrets.DB_USERNAME }}" \
             -var="db_password=${{ secrets.DB_PASSWORD }}" \
             -var="allowed_client_cidr=${{ secrets.ALLOWED_CLIENT_CIDR }}" \
-            -out=tfplan \
-            -detailed-exitcode \
-            -no-color 2>&1 | tee /tmp/tf_plan.txt
-          echo "PLAN_EXIT=${PIPESTATUS[0]}" >> $GITHUB_ENV
+            -out=tfplan -no-color \
+            2>&1 | tee /tmp/tf_plan.txt
+          PLAN_EXIT=$?
+          set -e
+          echo "PLAN_EXIT=$PLAN_EXIT" >> $GITHUB_ENV
 
-      # ── Terraform Apply — tiếp tục dù lỗi để phân loại ────────
+      - name: "Auto-import existing resources vào Terraform state"
+        if: ${{ !inputs.dry_run }}
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          echo "================================================================"
+          echo "  Auto-import: tránh lỗi 409 conflict"
+          echo "================================================================"
+
+          import_if_missing() {
+            local resource="$1" gcp_id="$2" desc="$3"
+            if terraform state show "$resource" &>/dev/null 2>&1; then
+              echo "  [SKIP] $desc — đã có trong state"
+            else
+              echo "  [IMPORT] $desc..."
+              terraform import "$resource" "$gcp_id" 2>&1 \
+                && echo "  [OK] Imported: $desc" \
+                || echo "  [WARN] Không import được (có thể chưa tồn tại): $desc"
+            fi
+          }
+
+          PROJECT=${{ env.PROJECT_ID }}
+          REGION=${{ env.REGION }}
+          ZONE=${{ env.VM_ZONE }}
+
+          # KMS KeyRing
+          import_if_missing \
+            "google_kms_key_ring.my_keyring" \
+            "projects/${PROJECT}/locations/${REGION}/keyRings/benchmark-keyring" \
+            "KMS KeyRing: benchmark-keyring"
+
+          # KMS Crypto Key
+          import_if_missing \
+            "google_kms_crypto_key.my_crypto_key" \
+            "projects/${PROJECT}/locations/${REGION}/keyRings/benchmark-keyring/cryptoKeys/benchmark-crypto-key" \
+            "KMS Crypto Key: benchmark-crypto-key"
+
+          # Storage bucket — thử các tên phổ biến
+          for BNAME in \
+            "benchmark-storage-v2-${PROJECT}" \
+            "benchmark-storage-${PROJECT}" \
+            "benchmark-storage-3a51a40b-8c9e-4126-804" \
+            "benchmark-storage-v2-3a51a40b-8c9e-4126-804"; do
+            if gsutil ls "gs://${BNAME}" &>/dev/null 2>&1; then
+              import_if_missing \
+                "google_storage_bucket.log_bucket" \
+                "$BNAME" \
+                "Storage bucket: $BNAME"
+              break
+            fi
+          done
+
+          # API Key
+          API_KEY_ID=$(gcloud alpha services api-keys list \
+            --project="$PROJECT" \
+            --format="value(name)" \
+            --filter="displayName:Restricted" \
+            2>/dev/null | head -1 || echo "")
+          [ -n "$API_KEY_ID" ] && import_if_missing \
+            "google_apikeys_key.restricted_api_key" \
+            "$API_KEY_ID" \
+            "API Key: restricted-app-key"
+
+          # Log Sink
+          SINK_EXISTS=$(gcloud logging sinks list \
+            --project="$PROJECT" \
+            --filter="name=benchmark-log-sink" \
+            --format="value(name)" 2>/dev/null || echo "")
+          [ -n "$SINK_EXISTS" ] && import_if_missing \
+            "google_logging_project_sink.log_sink" \
+            "projects/${PROJECT}/sinks/benchmark-log-sink" \
+            "Log Sink: benchmark-log-sink"
+
+          # VM
+          VM_EXISTS=$(gcloud compute instances describe benchmark-vm-01 \
+            --zone="$ZONE" --project="$PROJECT" \
+            --format="value(name)" 2>/dev/null || echo "")
+          [ -n "$VM_EXISTS" ] && import_if_missing \
+            "google_compute_instance.vm" \
+            "projects/${PROJECT}/zones/${ZONE}/instances/benchmark-vm-01" \
+            "VM: benchmark-vm-01"
+
+          # Grant serviceAccountUser
+          echo "  Kiểm tra quyền serviceAccountUser..."
+          gcloud iam service-accounts add-iam-policy-binding \
+            "app-least-privilege-sa@${PROJECT}.iam.gserviceaccount.com" \
+            --member="serviceAccount:github-actions-sa@${PROJECT}.iam.gserviceaccount.com" \
+            --role="roles/iam.serviceAccountUser" \
+            --project="$PROJECT" --quiet 2>/dev/null \
+            && echo "  [OK] serviceAccountUser granted" \
+            || echo "  [WARN] serviceAccountUser — đã có hoặc không cần"
+
+          echo "  Auto-import hoàn tất"
+        continue-on-error: true
+
       - name: Terraform Apply
         if: ${{ !inputs.dry_run }}
         working-directory: ${{ env.TF_DIR }}
         run: |
           set +e
           terraform apply -auto-approve tfplan 2>&1 | tee /tmp/tf_apply.txt
-          APPLY_EXIT=$?
+          APPLY_EXIT=${PIPESTATUS[0]}
           set -e
 
           echo "APPLY_EXIT=$APPLY_EXIT" >> $GITHUB_ENV
 
-          if [ $APPLY_EXIT -ne 0 ]; then
+          if [ "$APPLY_EXIT" -ne 0 ]; then
             echo "TF_FAILED=true" >> $GITHUB_ENV
-
-            # Phân loại lỗi
             ERROR_TYPE="TF_UNKNOWN"
-            if grep -qiE "already exists|conflict|409" /tmp/tf_apply.txt; then
-              ERROR_TYPE="TF_CONFLICT"
-            fi
-            if grep -qiE "does not have access|permission denied|403|serviceAccountUser|PERMISSION_DENIED" /tmp/tf_apply.txt; then
-              ERROR_TYPE="TF_PERMISSION"
-            fi
-            if grep -qiE "quota|RESOURCE_EXHAUSTED|429|rateLimitExceeded" /tmp/tf_apply.txt; then
-              ERROR_TYPE="TF_QUOTA"
-            fi
-            if grep -qiE "timeout|deadline exceeded|context deadline" /tmp/tf_apply.txt; then
-              ERROR_TYPE="TF_TIMEOUT"
-            fi
-
-            # Nếu vừa conflict vừa permission — ưu tiên permission
-            if grep -qiE "already exists|conflict|409" /tmp/tf_apply.txt && \
-               grep -qiE "serviceAccountUser|PERMISSION_DENIED" /tmp/tf_apply.txt; then
-              ERROR_TYPE="TF_CONFLICT,TF_PERMISSION"
-            fi
-
+            grep -qiE "already exists|conflict|409"              /tmp/tf_apply.txt && ERROR_TYPE="TF_CONFLICT"
+            grep -qiE "serviceAccountUser|PERMISSION_DENIED|403" /tmp/tf_apply.txt \
+              && ERROR_TYPE="${ERROR_TYPE},TF_PERMISSION"
+            grep -qiE "quota|RESOURCE_EXHAUSTED|429"             /tmp/tf_apply.txt && ERROR_TYPE="TF_QUOTA"
+            grep -qiE "timeout|deadline exceeded"                /tmp/tf_apply.txt && ERROR_TYPE="TF_TIMEOUT"
             echo "TF_ERROR_TYPE=$ERROR_TYPE" >> $GITHUB_ENV
-            echo "⚠ Terraform Apply FAILED — Error type: $ERROR_TYPE"
-            echo "--- Tail of apply log ---"
+            echo "⚠ Terraform Apply FAILED (exit: $APPLY_EXIT) — $ERROR_TYPE"
             tail -30 /tmp/tf_apply.txt
           else
-            echo "TF_FAILED=false"     >> $GITHUB_ENV
-            echo "TF_ERROR_TYPE=NONE"  >> $GITHUB_ENV
+            echo "TF_FAILED=false"    >> $GITHUB_ENV
+            echo "TF_ERROR_TYPE=NONE" >> $GITHUB_ENV
             echo "✓ Terraform Apply SUCCESS"
           fi
         continue-on-error: true
@@ -123,44 +201,34 @@ jobs:
       - name: Wait for resources to stabilize
         run: sleep 30
 
-      # ── CIS Full Check — chạy dù terraform lỗi ─────────────────
       - name: "CIS Full Check (29 controls)"
-        id: cis_check
         run: |
           chmod +x ${{ env.SCRIPTS_DIR }}/cis_full_check.sh
           cd ${{ env.SCRIPTS_DIR }}
-
           set +e
           ./cis_full_check.sh json /tmp/cis_report.json /tmp/cis_baseline_latest.json \
             2>&1 | tee /tmp/cis_output.txt
           CIS_EXIT=$?
           set -e
-
           echo "CIS_EXIT=$CIS_EXIT" >> $GITHUB_ENV
-
           if [ -f /tmp/cis_report.json ]; then
             echo "CIS_PASS=$(jq '.total_pass'      /tmp/cis_report.json)" >> $GITHUB_ENV
             echo "CIS_FAIL=$(jq '.total_fail'      /tmp/cis_report.json)" >> $GITHUB_ENV
             echo "CIS_RATE=$(jq '.compliance_rate' /tmp/cis_report.json)" >> $GITHUB_ENV
           else
-            echo "CIS_PASS=0"   >> $GITHUB_ENV
-            echo "CIS_FAIL=99"  >> $GITHUB_ENV
-            echo "CIS_RATE=0"   >> $GITHUB_ENV
+            echo "CIS_PASS=0"  >> $GITHUB_ENV
+            echo "CIS_FAIL=99" >> $GITHUB_ENV
+            echo "CIS_RATE=0"  >> $GITHUB_ENV
           fi
 
-      # ── Phase 1: Lưu baseline chỉ khi mọi thứ OK ───────────────
       - name: "[Phase 1] Lưu golden baseline"
-        if: |
-          env.CIS_EXIT == '0' &&
-          env.TF_FAILED == 'false' &&
-          !inputs.dry_run
+        if: env.CIS_EXIT == '0' && env.TF_FAILED != 'true' && !inputs.dry_run
         env:
           TF_STATE_BUCKET: ${{ env.TF_STATE_BUCKET }}
         run: |
           chmod +x ${{ env.SCRIPTS_DIR }}/baseline/init_baseline.sh
           ${{ env.SCRIPTS_DIR }}/baseline/init_baseline.sh \
-            /tmp/cis_report.json WF1 /tmp/context_info.json
-          echo "✓ Golden baseline saved"
+            /tmp/cis_report.json WF1 /tmp/context_info.json || true
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -173,33 +241,25 @@ jobs:
             /tmp/context_info.json
           retention-days: 30
 
-      # ── Quyết định trigger WF4 ──────────────────────────────────
       - name: "Quyết định trigger WF4"
         if: always() && !inputs.dry_run
         run: |
           TRIGGER_WF4=false
           TRIGGER_REASON=""
 
-          # Lỗi Terraform
           if [ "${{ env.TF_FAILED }}" = "true" ]; then
             TRIGGER_WF4=true
             TRIGGER_REASON="TF_ERROR:${{ env.TF_ERROR_TYPE }}"
           fi
 
-          # CIS FAIL
-          CIS_FAIL_COUNT="${{ env.CIS_FAIL }}"
-          if [ -n "$CIS_FAIL_COUNT" ] && [ "$CIS_FAIL_COUNT" != "0" ]; then
+          CIS_FAIL="${{ env.CIS_FAIL }}"
+          if [ "${CIS_FAIL:-0}" -gt 0 ]; then
             TRIGGER_WF4=true
-            if [ -n "$TRIGGER_REASON" ]; then
-              TRIGGER_REASON="${TRIGGER_REASON},CIS_FAIL:${CIS_FAIL_COUNT}"
-            else
-              TRIGGER_REASON="CIS_FAIL:${CIS_FAIL_COUNT}"
-            fi
+            TRIGGER_REASON="${TRIGGER_REASON:+$TRIGGER_REASON,}CIS_FAIL:${CIS_FAIL}"
           fi
 
           echo "TRIGGER_WF4=$TRIGGER_WF4"       >> $GITHUB_ENV
           echo "TRIGGER_REASON=$TRIGGER_REASON" >> $GITHUB_ENV
-
           echo "================================"
           echo "  TRIGGER_WF4 : $TRIGGER_WF4"
           echo "  REASON      : $TRIGGER_REASON"
@@ -212,13 +272,6 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            const reason    = process.env.TRIGGER_REASON  || 'UNKNOWN';
-            const cisFail   = process.env.CIS_FAIL        || '0';
-            const tfFailed  = process.env.TF_FAILED       || 'false';
-            const errorType = process.env.TF_ERROR_TYPE   || 'NONE';
-
-            console.log(`Triggering WF4 — reason: ${reason}`);
-
             await github.rest.actions.createWorkflowDispatch({
               owner:       context.repo.owner,
               repo:        context.repo.repo,
@@ -226,13 +279,13 @@ jobs:
               ref:         'main',
               inputs: {
                 trigger:        'WF1',
-                cis_fail_count: cisFail,
-                tf_failed:      tfFailed,
-                error_type:     errorType,
-                trigger_reason: reason,
+                cis_fail_count: process.env.CIS_FAIL   || '0',
+                tf_failed:      process.env.TF_FAILED   || 'false',
+                error_type:     process.env.TF_ERROR_TYPE || 'NONE',
+                trigger_reason: process.env.TRIGGER_REASON || 'WF1',
               }
             });
-            console.log('WF4 dispatched successfully');
+            console.log('WF4 triggered — reason:', process.env.TRIGGER_REASON);
 
       - name: Summary
         if: always()
