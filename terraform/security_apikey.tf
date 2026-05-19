@@ -22,6 +22,11 @@ resource "google_apikeys_key" "restricted_api_key" {
     }
   }
 
+  lifecycle {
+    prevent_destroy = false
+    ignore_changes  = [name, uid]
+  }
+
   depends_on = [
     google_project_service.apikeys_api,
     google_project_service.translate_api
