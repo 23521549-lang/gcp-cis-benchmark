@@ -216,30 +216,34 @@ jobs:
         run: |
           L2_FAIL=0
 
-          # CIS 4.5 — serial port
-          VM_EXISTS=$(gcloud compute instances list \
-            --project=${{ env.PROJECT_ID }} \
-            --filter="name=${{ env.VM_NAME }}" \
-            --format="value(name)" 2>/dev/null || echo "")
-          if [ -n "$VM_EXISTS" ]; then
-            VM_SERIAL=$(gcloud compute instances describe ${{ env.VM_NAME }} \
-              --zone=${{ env.VM_ZONE }} \
+          # CIS 4.5 — serial port (check cả 2 VM)
+          while IFS= read -r line; do
+            VM_I=$(echo "$line" | cut -f1)
+            Z_I=$(echo "$line"  | cut -f2)
+            [ -z "$VM_I" ] && continue
+            SERIAL=$(gcloud compute instances describe "$VM_I" \
+              --zone="$Z_I" \
               --project=${{ env.PROJECT_ID }} \
-              --format="value(metadata.items[serial-port-enable])" 2>/dev/null || echo "")
-            if [ "$VM_SERIAL" = "true" ] || [ "$VM_SERIAL" = "1" ]; then
-              echo "L2_FAIL: CIS 4.5 serial port vẫn bật"
+              --format="value(metadata.items[serial-port-enable])" \
+              2>/dev/null || echo "false")
+            if echo "$SERIAL" | grep -qiE "^true$|^1$"; then
+              echo "L2_FAIL: CIS 4.5 serial port vẫn bật trên $VM_I — value: $SERIAL"
               L2_FAIL=$((L2_FAIL+1))
             fi
-          fi
+          done < <(gcloud compute instances list \
+            --project=${{ env.PROJECT_ID }} \
+            --format="value(name,zone)" 2>/dev/null)
 
-          # CIS 5.1 — bucket public
-          gsutil ls -p ${{ env.PROJECT_ID }} 2>/dev/null | while read B; do
-            PUBLIC=$(gsutil iam get "$B" 2>/dev/null | grep -c "allUsers" || echo 0)
+          # CIS 5.1 — bucket public (không dùng Python inline)
+          while IFS= read -r B; do
+            [ -z "$B" ] && continue
+            PUBLIC=$(gsutil iam get "$B" 2>/dev/null | \
+              grep -c "allUsers\|allAuthenticatedUsers" || echo "0")
             if [ "${PUBLIC:-0}" -gt 0 ]; then
               echo "L2_FAIL: CIS 5.1 bucket $B vẫn public"
               L2_FAIL=$((L2_FAIL+1))
             fi
-          done
+          done < <(gsutil ls -p ${{ env.PROJECT_ID }} 2>/dev/null)
 
           # CIS 6.4 — SQL SSL
           SQL_INST=$(gcloud sql instances list \
@@ -249,11 +253,22 @@ jobs:
           if [ -n "$SQL_INST" ]; then
             SSL_VAL=$(gcloud sql instances describe "$SQL_INST" \
               --project=${{ env.PROJECT_ID }} \
-              --format="value(settings.ipConfiguration.requireSsl)" 2>/dev/null || echo "")
+              --format="value(settings.ipConfiguration.requireSsl)" \
+              2>/dev/null || echo "")
             if [ "$SSL_VAL" != "True" ]; then
               echo "L2_FAIL: CIS 6.4 requireSsl = $SSL_VAL"
               L2_FAIL=$((L2_FAIL+1))
             fi
+          fi
+
+          # CIS 2.2 — Log Sink tồn tại
+          SINK_OK=$(gcloud logging sinks list \
+            --project=${{ env.PROJECT_ID }} \
+            --filter="name=benchmark-log-sink" \
+            --format="value(name)" 2>/dev/null || echo "")
+          if [ -z "$SINK_OK" ]; then
+            echo "L2_FAIL: CIS 2.2 Log Sink chưa được tạo"
+            L2_FAIL=$((L2_FAIL+1))
           fi
 
           echo "L2_FAIL=$L2_FAIL" >> $GITHUB_ENV

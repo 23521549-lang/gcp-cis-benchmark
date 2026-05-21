@@ -3,6 +3,7 @@
 # Nhóm A — CIS policy tự động fix bằng gcloud
 # 21 controls: IAM, Logging, Network, VM, Storage, Cloud SQL
 # Hỗ trợ kiến trúc multi-subnet: Public + Private
+# FIX: chờ VM running trước khi update metadata CIS 4.5
 # ================================================================
 set -uo pipefail
 
@@ -32,9 +33,30 @@ err()   { echo -e "${RED}[ERROR]${RESET} $1";   FAILED=$((FAILED+1)); }
 needs_fix() {
   local cid="$1"
   if [ ! -f "$FAIL_LIST_FILE" ]; then
-    return 0  # full mode
+    return 0  # full mode — fix tất cả
   fi
-  jq -r '.[]' "$FAIL_LIST_FILE" 2>/dev/null | grep -qw "$cid"
+  jq -r '.[] // empty' "$FAIL_LIST_FILE" 2>/dev/null | grep -qw "$cid"
+}
+
+# Helper: chờ VM đạt trạng thái mong muốn
+wait_vm_status() {
+  local vm="$1" zone="$2" want="$3" max_wait="${4:-120}"
+  local elapsed=0
+  echo "  Chờ VM $vm đạt trạng thái $want..."
+  while [ "$elapsed" -lt "$max_wait" ]; do
+    STATUS=$(gcloud compute instances describe "$vm" \
+      --zone="$zone" --project="$PROJECT_ID" \
+      --format="value(status)" 2>/dev/null || echo "UNKNOWN")
+    if [ "$STATUS" = "$want" ]; then
+      echo "  VM $vm: $STATUS ✓"
+      return 0
+    fi
+    echo "  VM $vm: $STATUS — chờ thêm..."
+    sleep 10
+    elapsed=$((elapsed+10))
+  done
+  echo "  [WARN] Timeout chờ VM $vm đạt $want sau ${max_wait}s"
+  return 1
 }
 
 echo "================================================================"
@@ -292,7 +314,6 @@ if needs_fix "3.8"; then
     --filter="region:$REGION" \
     --format="value(name,region,purpose)" 2>/dev/null | \
     while read SUBNET REG PURPOSE; do
-      # Bỏ qua managed proxy subnets
       SKIP=false
       for SP in $SKIP_PURPOSES; do
         [ "$PURPOSE" = "$SP" ] && SKIP=true && break
@@ -317,13 +338,18 @@ if needs_fix "4.3"; then
   echo "[ 4.3 ] Block project-wide SSH keys..."
   gcloud compute instances list \
     --project="$PROJECT_ID" \
-    --format="value(name,zone)" 2>/dev/null | while read VM Z; do
-    run gcloud compute instances add-metadata "$VM" \
-      --zone="$Z" \
-      --metadata="block-project-ssh-keys=true" \
-      --project="$PROJECT_ID" 2>/dev/null \
-      && echo "  Done: $VM" \
-      || err "Không update được: $VM"
+    --format="value(name,zone,status)" 2>/dev/null | while read VM Z STATUS; do
+    # Chỉ update khi VM đang RUNNING hoặc TERMINATED
+    if [ "$STATUS" = "RUNNING" ] || [ "$STATUS" = "TERMINATED" ]; then
+      run gcloud compute instances add-metadata "$VM" \
+        --zone="$Z" \
+        --metadata="block-project-ssh-keys=true" \
+        --project="$PROJECT_ID" 2>/dev/null \
+        && echo "  Done: $VM ($STATUS)" \
+        || err "Không update được: $VM"
+    else
+      echo "  Skip $VM — status: $STATUS (chưa ổn định)"
+    fi
   done
   fixed "CIS 4.3 — Block project SSH keys (Bastion + App VM)"
 fi
@@ -333,29 +359,54 @@ if needs_fix "4.4"; then
   echo "[ 4.4 ] Bật OS Login..."
   gcloud compute instances list \
     --project="$PROJECT_ID" \
-    --format="value(name,zone)" 2>/dev/null | while read VM Z; do
-    run gcloud compute instances add-metadata "$VM" \
-      --zone="$Z" \
-      --metadata="enable-oslogin=true" \
-      --project="$PROJECT_ID" 2>/dev/null \
-      && echo "  Done: $VM" \
-      || err "Không update được: $VM"
+    --format="value(name,zone,status)" 2>/dev/null | while read VM Z STATUS; do
+    if [ "$STATUS" = "RUNNING" ] || [ "$STATUS" = "TERMINATED" ]; then
+      run gcloud compute instances add-metadata "$VM" \
+        --zone="$Z" \
+        --metadata="enable-oslogin=true" \
+        --project="$PROJECT_ID" 2>/dev/null \
+        && echo "  Done: $VM" \
+        || err "Không update được: $VM"
+    else
+      echo "  Skip $VM — status: $STATUS"
+    fi
   done
   fixed "CIS 4.4 — OS Login enabled (Bastion + App VM)"
 fi
 
 # ── CIS 4.5 — Tắt serial port (cả 2 VM) ─────────────────────────
+# FIX: chờ VM đạt RUNNING hoặc TERMINATED trước khi update metadata
 if needs_fix "4.5"; then
   echo "[ 4.5 ] Tắt serial port..."
   gcloud compute instances list \
     --project="$PROJECT_ID" \
-    --format="value(name,zone)" 2>/dev/null | while read VM Z; do
+    --format="value(name,zone,status)" 2>/dev/null | while read VM Z STATUS; do
+
+    # Nếu VM đang ở trạng thái trung gian (STAGING/STOPPING) → chờ
+    if [ "$STATUS" != "RUNNING" ] && [ "$STATUS" != "TERMINATED" ]; then
+      echo "  VM $VM đang ở trạng thái $STATUS — chờ ổn định..."
+      WAIT_COUNT=0
+      while [ "$WAIT_COUNT" -lt 12 ]; do
+        sleep 15
+        WAIT_COUNT=$((WAIT_COUNT+1))
+        NEW_STATUS=$(gcloud compute instances describe "$VM" \
+          --zone="$Z" --project="$PROJECT_ID" \
+          --format="value(status)" 2>/dev/null || echo "UNKNOWN")
+        echo "  VM $VM: $NEW_STATUS (${WAIT_COUNT}/12)"
+        if [ "$NEW_STATUS" = "RUNNING" ] || [ "$NEW_STATUS" = "TERMINATED" ]; then
+          STATUS="$NEW_STATUS"
+          break
+        fi
+      done
+    fi
+
+    echo "  Updating serial port: $VM (status: $STATUS)..."
     run gcloud compute instances add-metadata "$VM" \
       --zone="$Z" \
       --metadata="serial-port-enable=false" \
       --project="$PROJECT_ID" 2>/dev/null \
       && echo "  Done: $VM" \
-      || err "Không update được: $VM"
+      || err "Không update được: $VM (status: $STATUS)"
   done
   fixed "CIS 4.5 — Serial port disabled (Bastion + App VM)"
 fi
@@ -392,7 +443,6 @@ if [ -n "$SQL_INSTANCE" ]; then
   echo ""
   echo "[ Domain 6 ] Cloud SQL: $SQL_INSTANCE"
 
-  # CIS 6.4 — SSL
   if needs_fix "6.4"; then
     echo "  [ 6.4 ] Bật require_ssl..."
     run gcloud sql instances patch "$SQL_INSTANCE" \
@@ -402,7 +452,6 @@ if [ -n "$SQL_INSTANCE" ]; then
       || err "CIS 6.4 — Không patch được SSL"
   fi
 
-  # CIS 6.2.x — Database flags (1 lệnh, 1 restart)
   SQL_FLAGS_NEW=()
   needs_fix "6.2.1" && SQL_FLAGS_NEW+=("log_error_verbosity=default")
   needs_fix "6.2.2" && SQL_FLAGS_NEW+=("log_connections=on")
@@ -431,7 +480,7 @@ print(','.join(keep))
     run gcloud sql instances patch "$SQL_INSTANCE" \
       --database-flags="$ALL_FLAGS" \
       --project="$PROJECT_ID" --quiet 2>/dev/null \
-      && fixed "CIS 6.2.x + 6.2.8 — database flags patched (1 restart)" \
+      && fixed "CIS 6.2.x + 6.2.8 — database flags patched" \
       || err "CIS 6.2.x — Không patch được database flags"
   fi
 fi
@@ -443,7 +492,9 @@ echo "  Nhóm A Summary"
 echo "  FIXED: $FIXED | FAILED: $FAILED"
 echo "================================================================"
 
-echo "A_FIXED=$FIXED"   >> "${GITHUB_ENV:-/dev/null}" 2>/dev/null || true
-echo "A_FAILED=$FAILED" >> "${GITHUB_ENV:-/dev/null}" 2>/dev/null || true
+{
+  echo "A_FIXED=$FIXED"
+  echo "A_FAILED=$FAILED"
+} >> "${GITHUB_ENV:-/dev/null}" 2>/dev/null || true
 
 [ "$FAILED" -eq 0 ] && exit 0 || exit 1

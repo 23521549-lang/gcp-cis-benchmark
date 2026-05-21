@@ -100,14 +100,30 @@ jobs:
             -var="allowed_client_cidr=${{ secrets.ALLOWED_CLIENT_CIDR }}" \
             -detailed-exitcode -input=false -no-color \
             2>&1 | tee /tmp/drift_check.txt
-          DRIFT_EXIT=$?
+          # FIX: dùng PIPESTATUS[0] thay vì $? để lấy exit code của terraform
+          DRIFT_EXIT=${PIPESTATUS[0]}
           set -e
+
+          echo "DRIFT_EXIT=$DRIFT_EXIT" >> $GITHUB_ENV
+
           if [ "$DRIFT_EXIT" -eq 2 ]; then
-            echo "DRIFT_DETECTED=true"  >> $GITHUB_ENV
-            echo "⚠ DRIFT DETECTED"
+            echo "DRIFT_DETECTED=true" >> $GITHUB_ENV
+            # Đếm số resource bị drift
+            DRIFT_COUNT=$(grep -cE "will be (created|updated|destroyed)|must be replaced|has been deleted" \
+              /tmp/drift_check.txt 2>/dev/null || echo "0")
+            echo "DRIFT_COUNT=$DRIFT_COUNT" >> $GITHUB_ENV
+            echo "⚠ DRIFT DETECTED — $DRIFT_COUNT resource(s) bị thay đổi ngoài Terraform"
+            # In ra danh sách resource bị drift
+            grep -E "# .+ (will be|must be|has been)" /tmp/drift_check.txt \
+              | head -10 || true
+          elif [ "$DRIFT_EXIT" -eq 0 ]; then
+            echo "DRIFT_DETECTED=false" >> $GITHUB_ENV
+            echo "DRIFT_COUNT=0"        >> $GITHUB_ENV
+            echo "✓ No drift"
           else
             echo "DRIFT_DETECTED=false" >> $GITHUB_ENV
-            echo "✓ No drift"
+            echo "DRIFT_COUNT=0"        >> $GITHUB_ENV
+            echo "⚠ Terraform plan error (exit: $DRIFT_EXIT) — xem log chi tiết"
           fi
         continue-on-error: true
 
