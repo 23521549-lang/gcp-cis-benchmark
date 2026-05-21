@@ -82,6 +82,17 @@ jobs:
           echo "  Time      : $(date '+%Y-%m-%d %H:%M:%S UTC')"
           echo "================================================================"
           echo "WF4_START_TIME=$(date +%s)" >> $GITHUB_ENV
+      
+      - name: "Reset recovery loop counter"
+        run: |
+          # Reset counter về 0 mỗi lần WF4 được trigger mới
+          # Counter chỉ tăng trong quá trình chạy, không giữ state giữa các lần trigger
+          echo "0" | gsutil cp - \
+            gs://${{ env.TF_STATE_BUCKET }}/recovery/loop_counter.txt \
+            2>/dev/null \
+            && echo "✓ Loop counter reset về 0" \
+            || echo "  [WARN] Không reset được counter"
+        continue-on-error: true
 
       # ── Nhóm G: Check TRƯỚC — phát hiện loop, false positive ────
       - name: "[Nhóm G] Critical checks — loop detection & state"
