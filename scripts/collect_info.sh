@@ -1,27 +1,28 @@
 #!/bin/bash
 # ================================================================
-# Phase 0 — Thu thập thông tin hệ thống
-# Chạy TRƯỚC mọi workflow để tạo context
-# Output: /tmp/context_*.json
+# collect_info.sh
+# Phase 0 — System Information Collection
+# Outputs: /tmp/context_info.json, /tmp/iam_snapshot.json
 # ================================================================
 set -uo pipefail
 
 PROJECT_ID=$(gcloud config get-value project 2>/dev/null)
 if [ -z "$PROJECT_ID" ]; then
-  echo "ERROR: Chưa set project." && exit 1
+  echo "ERROR    Project not configured — run: gcloud config set project PROJECT_ID"
+  exit 1
 fi
 
 TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 OUTDIR="${1:-/tmp}"
-GREEN="\033[0;32m"; CYAN="\033[0;36m"; RESET="\033[0m"
+REGION="${REGION:-asia-southeast1}"
 
-echo -e "${CYAN}================================================================${RESET}"
-echo -e "${CYAN}  Phase 0 — Thu thập thông tin hệ thống${RESET}"
-echo -e "${CYAN}  Project: $PROJECT_ID | $(date '+%Y-%m-%d %H:%M:%S')${RESET}"
-echo -e "${CYAN}================================================================${RESET}"
+echo "════════════════════════════════════════════════════════════"
+echo " COLLECT  System Information Collection"
+echo " Project: $PROJECT_ID | $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+echo "════════════════════════════════════════════════════════════"
 
 # ── 1. Project metadata ──────────────────────────────────────────
-echo "[ 1/6 ] Project metadata..."
+echo "INFO     [1/6] Collecting project metadata..."
 PROJECT_INFO=$(gcloud projects describe "$PROJECT_ID" --format=json 2>/dev/null || echo '{}')
 PROJECT_NUMBER=$(echo "$PROJECT_INFO" | python3 -c "
 import json,sys
@@ -30,26 +31,24 @@ print(d.get('projectNumber',''))
 " 2>/dev/null || echo "")
 
 # ── 2. IAM snapshot ──────────────────────────────────────────────
-echo "[ 2/6 ] IAM binding snapshot..."
+echo "INFO     [2/6] Collecting IAM binding snapshot..."
 IAM_POLICY=$(gcloud projects get-iam-policy "$PROJECT_ID" \
   --format=json 2>/dev/null || echo '{"bindings":[]}')
 IAM_COUNT=$(echo "$IAM_POLICY" | python3 -c "
 import json,sys
 p=json.load(sys.stdin)
-total=sum(len(b.get('members',[])) for b in p.get('bindings',[]))
-print(total)
+print(sum(len(b.get('members',[])) for b in p.get('bindings',[])))
 " 2>/dev/null || echo "0")
 
 # ── 3. Resource inventory ────────────────────────────────────────
-echo "[ 3/6 ] Resource inventory..."
+echo "INFO     [3/6] Collecting resource inventory..."
 VM_LIST=$(gcloud compute instances list \
   --project="$PROJECT_ID" \
   --format="json(name,zone,status,tags.items,networkInterfaces[0].subnetwork,networkInterfaces[0].accessConfigs)" \
   2>/dev/null || echo '[]')
 
 VM_COUNT=$(echo "$VM_LIST" | python3 -c "
-import json,sys
-print(len(json.load(sys.stdin)))
+import json,sys; print(len(json.load(sys.stdin)))
 " 2>/dev/null || echo "0")
 
 BASTION_COUNT=$(echo "$VM_LIST" | python3 -c "
@@ -73,23 +72,21 @@ FW_LIST=$(gcloud compute firewall-rules list \
   --format="json(name,direction,allowed,sourceRanges,targetTags)" \
   2>/dev/null || echo '[]')
 FW_COUNT=$(echo "$FW_LIST" | python3 -c "
-import json,sys
-print(len(json.load(sys.stdin)))
+import json,sys; print(len(json.load(sys.stdin)))
 " 2>/dev/null || echo "0")
 
 # ── 4. Cloud SQL instances ───────────────────────────────────────
-echo "[ 4/6 ] Cloud SQL instances..."
+echo "INFO     [4/6] Collecting Cloud SQL instances..."
 SQL_LIST=$(gcloud sql instances list \
   --project="$PROJECT_ID" \
   --format="json(name,databaseVersion,state,settings.ipConfiguration,settings.databaseFlags)" \
   2>/dev/null || echo '[]')
 SQL_COUNT=$(echo "$SQL_LIST" | python3 -c "
-import json,sys
-print(len(json.load(sys.stdin)))
+import json,sys; print(len(json.load(sys.stdin)))
 " 2>/dev/null || echo "0")
 
-# ── 5. API services đang bật ──────────────────────────────────────
-echo "[ 5/6 ] Enabled API services..."
+# ── 5. API services ──────────────────────────────────────────────
+echo "INFO     [5/6] Collecting enabled API services..."
 API_LIST=$(gcloud services list --enabled \
   --project="$PROJECT_ID" \
   --format="value(config.name)" 2>/dev/null | sort || echo "")
@@ -100,15 +97,14 @@ SQLADMIN_ON=$(echo "$API_LIST"   | grep -c "sqladmin.googleapis.com"   || echo "
 SCC_ON=$(echo "$API_LIST"        | grep -c "securitycenter.googleapis.com" || echo "0")
 
 # ── 6. KMS keyrings ──────────────────────────────────────────────
-echo "[ 6/6 ] KMS keyrings..."
-REGION="${REGION:-asia-southeast1}"
+echo "INFO     [6/6] Collecting KMS keyrings..."
 KMS_LIST=$(gcloud kms keyrings list \
   --location="$REGION" \
   --project="$PROJECT_ID" \
   --format="value(name)" 2>/dev/null || echo "")
 KMS_COUNT=$(echo "$KMS_LIST" | grep -c . 2>/dev/null || echo "0")
 
-# ── Xuất context_info.json ───────────────────────────────────────
+# ── Output context_info.json ─────────────────────────────────────
 cat > "$OUTDIR/context_info.json" << JSONEOF
 {
   "timestamp": "$TIMESTAMP",
@@ -136,10 +132,12 @@ cat > "$OUTDIR/context_info.json" << JSONEOF
 }
 JSONEOF
 
-# Lưu IAM snapshot riêng để dùng cho IAM diff
 echo "$IAM_POLICY" > "$OUTDIR/iam_snapshot.json"
 
-echo ""
-echo -e "${GREEN}[OK]${RESET} context_info.json — VMs:$VM_COUNT (Bastion:$BASTION_COUNT Private:$PRIVATE_VM_COUNT) Buckets:$BUCKET_COUNT SQL:$SQL_COUNT FW:$FW_COUNT"
-echo -e "${GREEN}[OK]${RESET} iam_snapshot.json  — $IAM_COUNT bindings"
-echo -e "${GREEN}[OK]${RESET} API: cloudasset=$CLOUDASSET_ON sqladmin=$SQLADMIN_ON scc=$SCC_ON"
+echo "────────────────────────────────────────────────────────────"
+echo "OK       context_info.json"
+echo "         vms=$VM_COUNT (bastion=$BASTION_COUNT private=$PRIVATE_VM_COUNT)"
+echo "         buckets=$BUCKET_COUNT sql=$SQL_COUNT fw=$FW_COUNT kms=$KMS_COUNT"
+echo "OK       iam_snapshot.json — bindings=$IAM_COUNT"
+echo "OK       api_services — cloudasset=$CLOUDASSET_ON sqladmin=$SQLADMIN_ON scc=$SCC_ON"
+echo "════════════════════════════════════════════════════════════"

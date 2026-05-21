@@ -21,7 +21,7 @@ env:
 
 jobs:
   detect-affected-domains:
-    name: "Detect affected CIS domains"
+    name: "Detect Affected CIS Domains"
     runs-on: ubuntu-latest
     outputs:
       check_iam:        ${{ steps.detect.outputs.check_iam }}
@@ -37,19 +37,22 @@ jobs:
         with:
           fetch-depth: 2
 
-      - name: Detect changed files
+      - name: "Analysis | Detect Changed Terraform Files"
         id: detect
         run: |
+          echo "##[group]Analysis: Detect Affected CIS Domains"
           CHANGED=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || echo "terraform/")
-          echo "Changed: $CHANGED"
+          echo "INFO     Changed files:"
+          echo "$CHANGED" | sed 's/^/         /'
+
           IAM=false; LOGGING=false; NET=false; VM=false; STORAGE=false; SQL=false
 
           echo "$CHANGED" | grep -q "security_iam\|security_kms\|security_apikey" && IAM=true
-          echo "$CHANGED" | grep -q "logging"    && LOGGING=true
+          echo "$CHANGED" | grep -q "logging"       && LOGGING=true
           echo "$CHANGED" | grep -q "vpc\|networking" && NET=true
-          echo "$CHANGED" | grep -q "vm\|compute" && VM=true
-          echo "$CHANGED" | grep -q "storage"    && STORAGE=true
-          echo "$CHANGED" | grep -q "db\.tf"     && SQL=true
+          echo "$CHANGED" | grep -q "vm\|compute"   && VM=true
+          echo "$CHANGED" | grep -q "storage"       && STORAGE=true
+          echo "$CHANGED" | grep -q "db\.tf"        && SQL=true
 
           if echo "$CHANGED" | grep -q "provider\|variables\|outputs"; then
             IAM=true; LOGGING=true; NET=true; VM=true; STORAGE=true; SQL=true
@@ -61,7 +64,10 @@ jobs:
           echo "check_vm=$VM"           >> $GITHUB_OUTPUT
           echo "check_storage=$STORAGE" >> $GITHUB_OUTPUT
           echo "check_sql=$SQL"         >> $GITHUB_OUTPUT
-          echo "Domains: IAM=$IAM LOG=$LOGGING NET=$NET VM=$VM STG=$STORAGE SQL=$SQL"
+
+          echo "INFO     Affected domains:"
+          echo "         D1-IAM=$IAM  D2-LOG=$LOGGING  D3-NET=$NET  D4-VM=$VM  D5-STG=$STORAGE  D6-SQL=$SQL"
+          echo "##[endgroup]"
 
   terraform-plan:
     name: "Terraform Plan"
@@ -87,13 +93,14 @@ jobs:
         with:
           terraform_version: "~> 1.7"
 
-      - name: Terraform Init
+      - name: "Terraform | Initialize"
         working-directory: ${{ env.TF_DIR }}
         run: terraform init -upgrade
 
-      - name: Terraform Plan
+      - name: "Terraform | Plan"
         working-directory: ${{ env.TF_DIR }}
         run: |
+          echo "##[group]Terraform: Plan"
           set +e
           terraform plan \
             -var="db_username=${{ secrets.DB_USERNAME }}" \
@@ -103,8 +110,12 @@ jobs:
           PLAN_EXIT=$?
           set -e
           echo "PLAN_FAILED=$([ $PLAN_EXIT -ne 0 ] && echo true || echo false)" >> $GITHUB_ENV
+          [ $PLAN_EXIT -ne 0 ] \
+            && echo "##[error]Terraform plan failed (exit: $PLAN_EXIT)" \
+            || echo "OK       Terraform plan completed"
+          echo "##[endgroup]"
 
-      - name: Comment plan on PR
+      - name: "PR | Post Plan Comment"
         if: github.event_name == 'pull_request'
         uses: actions/github-script@v7
         with:
@@ -116,10 +127,10 @@ jobs:
             await github.rest.issues.createComment({
               owner: context.repo.owner, repo: context.repo.repo,
               issue_number: context.issue.number,
-              body: `## ${failed ? '❌' : '✅'} Terraform Plan\n\`\`\`\n${truncated}\n\`\`\``
+              body: `## ${failed ? 'FAILED' : 'SUCCESS'} — Terraform Plan\n\`\`\`\n${truncated}\n\`\`\``
             });
 
-      - name: Trigger WF4 nếu Plan FAIL
+      - name: "WF4 | Trigger on Plan Failure"
         if: env.PLAN_FAILED == 'true'
         uses: actions/github-script@v7
         with:
@@ -133,9 +144,10 @@ jobs:
                 trigger_reason: 'WF3_terraform_plan_failed',
               }
             });
+            console.log('[WF3] WF4 triggered — plan failed');
 
   terraform-apply:
-    name: "Terraform Apply + Verify + Update Baseline"
+    name: "Terraform Apply + CIS Verify + Baseline Update"
     runs-on: ubuntu-latest
     needs: [detect-affected-domains, terraform-plan]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -163,16 +175,20 @@ jobs:
         with:
           terraform_version: "~> 1.7"
 
-      - name: "Auto-import existing resources"
+      - name: "Terraform | Auto-import Existing Resources"
         working-directory: ${{ env.TF_DIR }}
         run: |
+          echo "##[group]Terraform: Auto-import Existing Resources"
           terraform init -upgrade
 
           import_if_missing() {
             local resource="$1" gcp_id="$2" desc="$3"
             terraform state show "$resource" &>/dev/null 2>&1 \
-              && echo "  [SKIP] $desc" \
-              || { echo "  [IMPORT] $desc..."; terraform import "$resource" "$gcp_id" 2>&1 || true; }
+              && echo "SKIP     $desc — already in state" \
+              || { echo "RUN      Importing: $desc"
+                   terraform import "$resource" "$gcp_id" 2>&1 \
+                     && echo "OK       Imported: $desc" \
+                     || echo "##[warning]Import failed: $desc"; }
           }
 
           PROJECT=${{ env.PROJECT_ID }}
@@ -182,20 +198,21 @@ jobs:
           import_if_missing "google_kms_key_ring.my_keyring" \
             "projects/${PROJECT}/locations/${REGION}/keyRings/benchmark-keyring" "KMS KeyRing"
           import_if_missing "google_kms_crypto_key.my_crypto_key" \
-            "projects/${PROJECT}/locations/${REGION}/keyRings/benchmark-keyring/cryptoKeys/benchmark-crypto-key" "KMS Key"
+            "projects/${PROJECT}/locations/${REGION}/keyRings/benchmark-keyring/cryptoKeys/benchmark-crypto-key" "KMS CryptoKey"
 
           for BNAME in "benchmark-storage-v2-${PROJECT}" "benchmark-storage-${PROJECT}" \
                        "benchmark-storage-3a51a40b-8c9e-4126-804" \
                        "benchmark-storage-v2-3a51a40b-8c9e-4126-804"; do
             gsutil ls "gs://${BNAME}" &>/dev/null 2>&1 && {
-              import_if_missing "google_storage_bucket.log_bucket" "$BNAME" "Storage bucket: $BNAME"
+              import_if_missing "google_storage_bucket.log_bucket" "$BNAME" "Storage Bucket: $BNAME"
               break
             } || true
           done
 
           API_KEY=$(gcloud alpha services api-keys list --project="$PROJECT" \
             --format="value(name)" --filter="displayName:Restricted" 2>/dev/null | head -1 || echo "")
-          [ -n "$API_KEY" ] && import_if_missing "google_apikeys_key.restricted_api_key" "$API_KEY" "API Key"
+          [ -n "$API_KEY" ] && import_if_missing \
+            "google_apikeys_key.restricted_api_key" "$API_KEY" "API Key"
 
           SINK=$(gcloud logging sinks list --project="$PROJECT" \
             --filter="name=benchmark-log-sink" --format="value(name)" 2>/dev/null || echo "")
@@ -205,18 +222,21 @@ jobs:
           VM=$(gcloud compute instances describe benchmark-vm-01 \
             --zone="$ZONE" --project="$PROJECT" --format="value(name)" 2>/dev/null || echo "")
           [ -n "$VM" ] && import_if_missing "google_compute_instance.vm" \
-            "projects/${PROJECT}/zones/${ZONE}/instances/benchmark-vm-01" "VM"
+            "projects/${PROJECT}/zones/${ZONE}/instances/benchmark-vm-01" "VM: benchmark-vm-01"
 
           gcloud iam service-accounts add-iam-policy-binding \
             "app-least-privilege-sa@${PROJECT}.iam.gserviceaccount.com" \
             --member="serviceAccount:github-actions-sa@${PROJECT}.iam.gserviceaccount.com" \
             --role="roles/iam.serviceAccountUser" \
-            --project="$PROJECT" --quiet 2>/dev/null || true
+            --project="$PROJECT" --quiet 2>/dev/null \
+            && echo "OK       serviceAccountUser permission verified" || true
+          echo "##[endgroup]"
         continue-on-error: true
 
-      - name: Terraform Apply
+      - name: "Terraform | Apply"
         working-directory: ${{ env.TF_DIR }}
         run: |
+          echo "##[group]Terraform: Apply"
           set +e
           terraform apply -auto-approve \
             -var="db_username=${{ secrets.DB_USERNAME }}" \
@@ -234,61 +254,63 @@ jobs:
               && ERROR_TYPE="${ERROR_TYPE},TF_PERMISSION"
             grep -qiE "quota|RESOURCE_EXHAUSTED"                 /tmp/tf_apply.txt && ERROR_TYPE="TF_QUOTA"
             echo "TF_ERROR_TYPE=$ERROR_TYPE" >> $GITHUB_ENV
-            echo "⚠ Apply FAILED: $ERROR_TYPE"
+            echo "##[error]Terraform apply failed — $ERROR_TYPE"
           else
             echo "TF_FAILED=false"    >> $GITHUB_ENV
             echo "TF_ERROR_TYPE=NONE" >> $GITHUB_ENV
-            echo "✓ Apply SUCCESS"
+            echo "OK       Terraform apply completed successfully"
           fi
+          echo "##[endgroup]"
         continue-on-error: true
 
-      - name: Wait for propagation
+      - name: "Wait | Resource Propagation (30s)"
         run: sleep 30
 
-      - name: "[Verify] IAM"
+      - name: "CIS | Verify Domain 1 — IAM"
         if: needs.detect-affected-domains.outputs.check_iam == 'true'
         run: |
           chmod +x ${{ env.SCRIPTS_DIR }}/check_iam.sh
           set +e; ${{ env.SCRIPTS_DIR }}/check_iam.sh 2>&1 | tee /tmp/verify_iam.txt; set -e
         continue-on-error: true
 
-      - name: "[Verify] Logging"
+      - name: "CIS | Verify Domain 2 — Logging"
         if: needs.detect-affected-domains.outputs.check_logging == 'true'
         run: |
           chmod +x ${{ env.SCRIPTS_DIR }}/check_logging.sh
           set +e; ${{ env.SCRIPTS_DIR }}/check_logging.sh 2>&1 | tee /tmp/verify_logging.txt; set -e
         continue-on-error: true
 
-      - name: "[Verify] Networking"
+      - name: "CIS | Verify Domain 3 — Networking"
         if: needs.detect-affected-domains.outputs.check_networking == 'true'
         run: |
           chmod +x ${{ env.SCRIPTS_DIR }}/check_networking.sh
           set +e; ${{ env.SCRIPTS_DIR }}/check_networking.sh 2>&1 | tee /tmp/verify_net.txt; set -e
         continue-on-error: true
 
-      - name: "[Verify] VM"
+      - name: "CIS | Verify Domain 4 — Virtual Machines"
         if: needs.detect-affected-domains.outputs.check_vm == 'true'
         run: |
           chmod +x ${{ env.SCRIPTS_DIR }}/check_vm.sh
           set +e; ${{ env.SCRIPTS_DIR }}/check_vm.sh 2>&1 | tee /tmp/verify_vm.txt; set -e
         continue-on-error: true
 
-      - name: "[Verify] Storage"
+      - name: "CIS | Verify Domain 5 — Storage"
         if: needs.detect-affected-domains.outputs.check_storage == 'true'
         run: |
           chmod +x ${{ env.SCRIPTS_DIR }}/check_storage.sh
           set +e; ${{ env.SCRIPTS_DIR }}/check_storage.sh 2>&1 | tee /tmp/verify_storage.txt; set -e
         continue-on-error: true
 
-      - name: "[Verify] Cloud SQL"
+      - name: "CIS | Verify Domain 6 — Cloud SQL"
         if: needs.detect-affected-domains.outputs.check_sql == 'true'
         run: |
           chmod +x ${{ env.SCRIPTS_DIR }}/check_sql.sh
           set +e; ${{ env.SCRIPTS_DIR }}/check_sql.sh 2>&1 | tee /tmp/verify_sql.txt; set -e
         continue-on-error: true
 
-      - name: "Tổng hợp kết quả"
+      - name: "Analysis | Aggregate Verification Results"
         run: |
+          echo "##[group]Analysis: Aggregate CIS Verification Results"
           VERIFY_FAIL=0
           for f in /tmp/verify_*.txt; do
             [ -f "$f" ] && COUNT=$(grep -c "\[FAIL\]" "$f" 2>/dev/null || true) || COUNT=0
@@ -296,7 +318,6 @@ jobs:
           done
           echo "VERIFY_FAIL=$VERIFY_FAIL" >> $GITHUB_ENV
 
-          # Full CIS check để phát hiện FAIL ngoài domain verify
           CIS_FAIL_FULL=0
           CIS_RATE_WF3=100
           if [ "$VERIFY_FAIL" -eq 0 ] && [ "${{ env.TF_FAILED }}" != "true" ]; then
@@ -307,31 +328,32 @@ jobs:
             set -e
             cd ..
             if [ -f /tmp/cis_report_wf3.json ]; then
-              CIS_FAIL_FULL=$(jq '.total_fail'      /tmp/cis_report_wf3.json 2>/dev/null || echo 0)
-              CIS_RATE_WF3=$(jq '.compliance_rate'  /tmp/cis_report_wf3.json 2>/dev/null || echo 100)
+              CIS_FAIL_FULL=$(jq '.total_fail'     /tmp/cis_report_wf3.json 2>/dev/null || echo 0)
+              CIS_RATE_WF3=$(jq '.compliance_rate' /tmp/cis_report_wf3.json 2>/dev/null || echo 100)
             fi
           fi
           echo "CIS_FAIL_FULL=$CIS_FAIL_FULL" >> $GITHUB_ENV
           echo "CIS_RATE_WF3=$CIS_RATE_WF3"   >> $GITHUB_ENV
 
-          echo "================================"
-          echo "  TF_FAILED   : ${{ env.TF_FAILED }}"
-          echo "  VERIFY_FAIL : $VERIFY_FAIL"
-          echo "  CIS_FAIL    : $CIS_FAIL_FULL"
-          echo "  CIS_RATE    : $CIS_RATE_WF3%"
-          echo "================================"
+          echo "INFO     Terraform failed : ${{ env.TF_FAILED }}"
+          echo "INFO     Verify failures  : $VERIFY_FAIL"
+          echo "INFO     CIS fail count   : $CIS_FAIL_FULL"
+          echo "INFO     Compliance rate  : $CIS_RATE_WF3%"
+          echo "##[endgroup]"
 
-      - name: "[Phase 1] Update baseline nếu 100% PASS"
+      - name: "Phase 1 | Update Baseline (100% Pass Only)"
         if: env.VERIFY_FAIL == '0' && env.TF_FAILED == 'false' && env.CIS_FAIL_FULL == '0'
         env:
           TF_STATE_BUCKET: ${{ env.TF_STATE_BUCKET }}
         run: |
+          echo "##[group]Phase 1: Baseline Update"
           chmod +x ${{ env.SCRIPTS_DIR }}/baseline/init_baseline.sh
           ${{ env.SCRIPTS_DIR }}/baseline/init_baseline.sh \
             /tmp/cis_report_wf3.json WF3 /tmp/context_info.json || true
-          echo "✓ Baseline updated after WF3"
+          echo "OK       Baseline updated after WF3 upgrade"
+          echo "##[endgroup]"
 
-      - name: Upload artifacts
+      - name: "Artifacts | Upload Reports"
         uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -342,9 +364,10 @@ jobs:
             /tmp/cis_report_wf3.json
           retention-days: 30
 
-      - name: "Quyết định trigger WF4"
+      - name: "WF4 | Evaluate Trigger Conditions"
         if: always()
         run: |
+          echo "##[group]WF4 Trigger Evaluation"
           TRIGGER_WF4=false
           TRIGGER_REASON=""
           TF_FAILED="${{ env.TF_FAILED }}"
@@ -354,16 +377,13 @@ jobs:
             TRIGGER_WF4=true
             TRIGGER_REASON="WF3_TF_ERROR:${ERROR_TYPE}"
           }
-
           [ "${VERIFY_FAIL:-0}" -gt 0 ] && {
             TRIGGER_WF4=true
             TRIGGER_REASON="${TRIGGER_REASON:+$TRIGGER_REASON,}WF3_VERIFY_FAIL:${{ env.VERIFY_FAIL }}"
           }
-
           [ "${CIS_FAIL_FULL:-0}" -gt 0 ] && {
             TRIGGER_WF4=true
-            TRIGGER_REASON="${TRIGGER_REASON:+$TRIGGER_REASON,}WF3_CIS_FAIL:${{ env.CIS_FAIL_FULL }}(rate:${{ env.CIS_RATE_WF3 }}%)"
-            # Upload fail list cho WF4
+            TRIGGER_REASON="${TRIGGER_REASON:+$TRIGGER_REASON,}WF3_CIS_FAIL:${{ env.CIS_FAIL_FULL }}"
             if [ -f /tmp/control_fail_list.json ]; then
               gsutil cp /tmp/control_fail_list.json \
                 gs://${{ env.TF_STATE_BUCKET }}/recovery/control_fail_list.json \
@@ -373,10 +393,11 @@ jobs:
 
           echo "TRIGGER_WF4=$TRIGGER_WF4"       >> $GITHUB_ENV
           echo "TRIGGER_REASON=$TRIGGER_REASON" >> $GITHUB_ENV
-          echo "  TRIGGER_WF4 : $TRIGGER_WF4"
-          echo "  REASON      : $TRIGGER_REASON"
+          echo "INFO     Trigger WF4 : $TRIGGER_WF4"
+          echo "INFO     Reason      : ${TRIGGER_REASON:-none}"
+          echo "##[endgroup]"
 
-      - name: "Trigger WF4 Recovery"
+      - name: "WF4 | Trigger Recovery Pipeline"
         if: always() && env.TRIGGER_WF4 == 'true'
         uses: actions/github-script@v7
         with:
@@ -392,18 +413,24 @@ jobs:
                 trigger_reason: process.env.TRIGGER_REASON  || 'WF3',
               }
             });
-            console.log('WF4 triggered:', process.env.TRIGGER_REASON);
+            console.log('[WF3] WF4 triggered — reason:', process.env.TRIGGER_REASON);
 
-      - name: Summary
+      - name: "Summary | Upgrade Report"
         if: always()
         run: |
-          echo "================================================"
-          echo "  WF3 Upgrade Summary"
-          echo "  TF_FAILED   : ${{ env.TF_FAILED }}"
-          echo "  TF_ERROR    : ${{ env.TF_ERROR_TYPE }}"
-          echo "  VERIFY_FAIL : ${{ env.VERIFY_FAIL }}"
-          echo "  CIS_FAIL    : ${{ env.CIS_FAIL_FULL }}"
-          echo "  CIS_RATE    : ${{ env.CIS_RATE_WF3 }}%"
-          echo "  WF4 TRIGGER : ${{ env.TRIGGER_WF4 }}"
-          echo "  REASON      : ${{ env.TRIGGER_REASON }}"
-          echo "================================================"
+          echo "##[group]WF3 Upgrade Summary"
+          echo "────────────────────────────────────────────────"
+          echo " WF3  Safe Upgrade"
+          echo " Run  #${{ github.run_number }} | $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          echo "────────────────────────────────────────────────"
+          echo " Terraform"
+          echo "   Status  : ${{ env.TF_FAILED == 'true' && 'FAILED' || 'SUCCESS' }}"
+          echo "   Error   : ${{ env.TF_ERROR_TYPE }}"
+          echo " CIS Verification"
+          echo "   Fail    : ${{ env.VERIFY_FAIL }}"
+          echo "   Rate    : ${{ env.CIS_RATE_WF3 }}%"
+          echo " Recovery"
+          echo "   WF4     : ${{ env.TRIGGER_WF4 }}"
+          echo "   Reason  : ${{ env.TRIGGER_REASON }}"
+          echo "────────────────────────────────────────────────"
+          echo "##[endgroup]"

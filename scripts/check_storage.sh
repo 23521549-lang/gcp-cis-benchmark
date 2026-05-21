@@ -1,29 +1,32 @@
 #!/bin/bash
 # ================================================================
+# check_storage.sh
 # CIS GCP Benchmark v4.0.0 — Domain 5: Storage
-# CIS 5.1 / 5.2
+# Controls: 5.1 / 5.2
 # ================================================================
 set -uo pipefail
 
 PROJECT_ID=$(gcloud config get-value project 2>/dev/null)
-[ -z "$PROJECT_ID" ] && echo "ERROR: Chưa set project." && exit 1
+[ -z "$PROJECT_ID" ] && echo "ERROR    Project not configured" && exit 1
 
-GREEN="\033[0;32m"; RED="\033[0;31m"; YELLOW="\033[0;33m"; RESET="\033[0m"
 PASS=0; FAIL=0
 
-pass() { echo -e "${GREEN}[PASS]${RESET} $1"; PASS=$((PASS+1)); }
-fail() { echo -e "${RED}[FAIL]${RESET} $1"; FAIL=$((FAIL+1)); }
-info() { echo -e "${YELLOW}      $1${RESET}"; }
+pass() { echo "PASS     $1"; PASS=$((PASS+1)); }
+fail() { echo "FAIL     $1"; FAIL=$((FAIL+1)); }
+info() { echo "         $1"; }
 
-echo "================================================================"
-echo "  CIS STORAGE CHECK — PROJECT: $PROJECT_ID"
-echo "================================================================"
-echo ""
+echo "════════════════════════════════════════════════════════════"
+echo " CHECK    [D5] Storage"
+echo " Project: $PROJECT_ID"
+echo "════════════════════════════════════════════════════════════"
 
 BUCKETS=$(gsutil ls -p "$PROJECT_ID" 2>/dev/null | sed 's|gs://||;s|/||' || echo "")
 
 if [ -z "$BUCKETS" ]; then
-  echo -e "${YELLOW}[INFO]${RESET} Không có bucket nào trong project"
+  echo "INFO     No storage buckets found in project"
+  echo "════════════════════════════════════════════════════════════"
+  echo " RESULT   [D5] Storage — Status: N/A (no buckets)"
+  echo "════════════════════════════════════════════════════════════"
   exit 0
 fi
 
@@ -33,7 +36,7 @@ PUBLIC_PASS=0; UNIFORM_PASS=0
 while IFS= read -r BUCKET; do
   [ -z "$BUCKET" ] && continue
 
-  # ── CIS 5.1 — Bucket không public ──────────────────────────────
+  # ── CIS 5.1 — No public access ─────────────────────────────────
   IAM=$(gsutil iam get "gs://$BUCKET" 2>/dev/null || echo "{}")
   IS_PUBLIC=$(echo "$IAM" | python3 -c "
 import json, sys
@@ -42,7 +45,7 @@ try:
     for b in data.get('bindings',[]):
         for m in b.get('members',[]):
             if m in ['allUsers','allAuthenticatedUsers']:
-                print(f'{m}->{b[\"role\"]}')
+                print(f'{m}={b[\"role\"]}')
 except: pass
 " 2>/dev/null || echo "")
 
@@ -50,8 +53,8 @@ except: pass
     PUBLIC_PASS=$((PUBLIC_PASS+1))
   else
     PUBLIC_FAIL=$((PUBLIC_FAIL+1))
-    fail "5.1 Bucket '$BUCKET' có public access: $IS_PUBLIC"
-    info "Fix: gsutil iam ch -d allUsers gs://$BUCKET"
+    fail "CIS-5.1  result=non-compliant bucket=$BUCKET $IS_PUBLIC"
+    info "Action:  gsutil iam ch -d allUsers gs://$BUCKET"
   fi
 
   # ── CIS 5.2 — Uniform Bucket-Level Access ──────────────────────
@@ -62,27 +65,26 @@ except: pass
     UNIFORM_PASS=$((UNIFORM_PASS+1))
   else
     UNIFORM_FAIL=$((UNIFORM_FAIL+1))
-    fail "5.2 Bucket '$BUCKET' chưa bật Uniform Bucket-Level Access"
-    info "Fix: gsutil uniformbucketlevelaccess set on gs://$BUCKET"
+    fail "CIS-5.2  result=non-compliant bucket=$BUCKET uniform-access=disabled"
+    info "Action:  gsutil uniformbucketlevelaccess set on gs://$BUCKET"
   fi
+
 done <<< "$BUCKETS"
 
-# Summary CIS 5.1
-if [ "$PUBLIC_FAIL" -eq 0 ]; then
-  pass "CIS 5.1: Tất cả bucket không public ($PUBLIC_PASS buckets kiểm tra)"
-fi
+TOTAL_BUCKETS=$(echo "$BUCKETS" | grep -c . || echo "0")
 
-# Summary CIS 5.2
-if [ "$UNIFORM_FAIL" -eq 0 ]; then
-  pass "CIS 5.2: Tất cả bucket có Uniform Bucket-Level Access ($UNIFORM_PASS buckets)"
-fi
+[ "$PUBLIC_FAIL" -eq 0 ] && \
+  pass "CIS-5.1  result=compliant public-access=absent buckets=$TOTAL_BUCKETS"
+[ "$UNIFORM_FAIL" -eq 0 ] && \
+  pass "CIS-5.2  result=compliant uniform-access=enabled buckets=$TOTAL_BUCKETS"
 
+echo ""
 TOTAL=$((PASS+FAIL))
-echo "================================================================"
-if [ "$FAIL" -eq 0 ]; then
-  echo -e "  ${GREEN}KẾT QUẢ: $PASS/$TOTAL PASS — Đạt chuẩn CIS Storage${RESET}"
-else
-  echo -e "  KẾT QUẢ: ${GREEN}$PASS PASS${RESET} | ${RED}$FAIL FAIL${RESET} (tổng $TOTAL tiêu chí)"
-fi
-echo "================================================================"
+echo "════════════════════════════════════════════════════════════"
+echo " RESULT   [D5] Storage"
+printf "          Passed: %-3s  Failed: %-3s  Total: %s\n" "$PASS" "$FAIL" "$TOTAL"
+[ "$FAIL" -eq 0 ] \
+  && echo "          Status: COMPLIANT" \
+  || echo "          Status: NON-COMPLIANT"
+echo "════════════════════════════════════════════════════════════"
 exit $FAIL

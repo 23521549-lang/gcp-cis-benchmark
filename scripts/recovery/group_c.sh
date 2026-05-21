@@ -1,8 +1,8 @@
 #!/bin/bash
 # ================================================================
-# Nhóm C — CIS controls cần xác nhận thủ công
-# 1.6, 2.3, 2.4, 3.3, 3.6
-# In hướng dẫn chi tiết + gửi vào notify
+# group_c.sh
+# Group C — Manual Action Guidance
+# Controls requiring human confirmation: 1.6, 2.3, 2.4, 3.3, 3.6
 # ================================================================
 set -uo pipefail
 
@@ -11,63 +11,55 @@ FAIL_LIST_FILE="${FAIL_LIST_FILE:-/tmp/control_fail_list.json}"
 ALERT_EMAIL="${ALERT_EMAIL:-23521549@gm.uit.edu.vn}"
 ALLOWED_CLIENT_CIDR="${ALLOWED_CLIENT_CIDR:-YOUR_IP/32}"
 
-YELLOW="\033[0;33m"; CYAN="\033[0;36m"; RESET="\033[0m"
 C_COUNT=0
 
-manual() {
-  echo -e "${YELLOW}[MANUAL REQUIRED]${RESET} $1"
-  C_COUNT=$((C_COUNT+1))
-}
+manual() { echo "MANUAL   $1"; C_COUNT=$((C_COUNT+1)); }
+step()   { echo "         -> $1"; }
+info()   { echo "INFO     $1"; }
 
-step() { echo -e "  ${CYAN}→${RESET} $1"; }
-
-# Kiểm tra control có cần fix không
 needs_fix() {
   local cid="$1"
-  if [ ! -f "$FAIL_LIST_FILE" ]; then
-    return 0
-  fi
+  [ ! -f "$FAIL_LIST_FILE" ] && return 0
   jq -r '.[]' "$FAIL_LIST_FILE" 2>/dev/null | grep -qw "$cid"
 }
 
-echo "================================================================"
-echo "  NHÓM C — Manual Actions Required"
-echo "  Project: $PROJECT_ID"
-echo "  Email hướng dẫn sẽ gửi tới: $ALERT_EMAIL"
-echo "================================================================"
-echo ""
+echo "════════════════════════════════════════════════════════════"
+echo " GROUP C  Manual Action Guidance"
+echo " Project: $PROJECT_ID"
+echo " Contact: $ALERT_EMAIL"
+echo " Time   : $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+echo "════════════════════════════════════════════════════════════"
 
 C_STEPS=""
 
 # ── CIS 1.6 — SA User/Token Creator at project level ─────────────
 if needs_fix "1.6"; then
-  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-  manual "CIS 1.6 — SA User/Token Creator ở project level"
-  echo "  Lý do không tự động: Cần xác nhận người dùng nào được phép"
+  echo "────────────────────────────────────────────────────────────"
+  manual "CIS-1.6  SA User/Token Creator binding at project level"
+  info   "Reason:  Requires confirmation of which users are authorized"
   echo ""
-  echo "  Kiểm tra:"
-  step "gcloud projects get-iam-policy $PROJECT_ID --format=json | python3 -c \""
-  step "  import json,sys; p=json.load(sys.stdin)"
-  step "  roles=['roles/iam.serviceAccountUser','roles/iam.serviceAccountTokenCreator']"
-  step "  [print(m,'->',b['role']) for b in p.get('bindings',[]) for m in b.get('members',[])"
+  info   "Inspect:"
+  step "gcloud projects get-iam-policy $PROJECT_ID --format=json | python3 -c \\"
+  step "  \"import json,sys; p=json.load(sys.stdin)\\"
+  step "  roles=['roles/iam.serviceAccountUser','roles/iam.serviceAccountTokenCreator']\\"
+  step "  [print(m,'->',b['role']) for b in p.get('bindings',[]) for m in b.get('members',[])\\"
   step "   if b['role'] in roles and m.startswith(('user:','group:'))]\""
   echo ""
-  echo "  Fix (thay bằng email thực tế):"
+  info   "Remediate:"
   step "gcloud projects remove-iam-policy-binding $PROJECT_ID \\"
   step "  --member='user:EMAIL' --role='roles/iam.serviceAccountUser'"
   echo ""
-  C_STEPS="${C_STEPS}CIS 1.6: Remove SA User/Token Creator binding at project level\n"
+  C_STEPS="${C_STEPS}CIS-1.6: Remove SA User/Token Creator binding at project level\n"
 fi
 
-# ── CIS 2.3 — Bucket Lock ────────────────────────────────────────
+# ── CIS 2.3 — Retention Policy + Bucket Lock ─────────────────────
 if needs_fix "2.3"; then
-  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-  manual "CIS 2.3 — Retention Policy + Bucket Lock"
-  echo "  Lý do không tự động: Bucket lock là VĨNH VIỄN, không thể undo"
-  echo "  Cảnh báo: Sau khi lock, KHÔNG XÓA ĐƯỢC objects cho đến hết retention period"
+  echo "────────────────────────────────────────────────────────────"
+  manual "CIS-2.3  Retention Policy + Bucket Lock"
+  info   "Reason:  Bucket lock is PERMANENT and irreversible"
+  info   "WARNING: After locking, objects cannot be deleted until retention expires"
   echo ""
 
-  # Lấy tên log bucket
   LOG_BUCKET=$(gcloud logging sinks list \
     --project="$PROJECT_ID" \
     --format=json 2>/dev/null | python3 -c "
@@ -80,119 +72,109 @@ for s in sinks:
         break
 " 2>/dev/null || echo "YOUR_LOG_BUCKET")
 
-  echo "  Log bucket phát hiện: $LOG_BUCKET"
+  info   "Target bucket: $LOG_BUCKET"
   echo ""
-  echo "  Fix (qua Console):"
-  step "Vào: https://console.cloud.google.com/storage/browser/$LOG_BUCKET"
+  info   "Option 1 — Console:"
+  step "https://console.cloud.google.com/storage/browser/$LOG_BUCKET"
   step "Bucket details > Protection > Retention policy"
-  step "Set: 30 ngày (2592000 giây)"
-  step "Click 'Lock' để khoá vĩnh viễn"
+  step "Set: 30 days (2592000 seconds) then click Lock"
   echo ""
-  echo "  Fix (qua CLI — THẬN TRỌNG):"
+  info   "Option 2 — CLI (CAUTION — irreversible):"
   step "gsutil retention set 30d gs://$LOG_BUCKET"
-  step "gsutil retention lock gs://$LOG_BUCKET   # KHÔNG THỂ UNDO"
+  step "gsutil retention lock gs://$LOG_BUCKET"
   echo ""
-  C_STEPS="${C_STEPS}CIS 2.3: Set retention policy 30d + lock on gs://$LOG_BUCKET\n"
+  C_STEPS="${C_STEPS}CIS-2.3: Set retention 30d + lock on gs://$LOG_BUCKET (IRREVERSIBLE)\n"
 fi
 
-# ── CIS 2.4 — Alert Policy verify ────────────────────────────────
+# ── CIS 2.4 — Alert Policy verification ──────────────────────────
 if needs_fix "2.4"; then
-  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-  manual "CIS 2.4 — Alert Policy cho Project Ownership Changes"
-  echo "  Lý do không tự động: Cần verify notification channel hoạt động"
+  echo "────────────────────────────────────────────────────────────"
+  manual "CIS-2.4  Alert Policy for Project Ownership Changes"
+  info   "Reason:  Notification channel must be verified as working"
   echo ""
-  echo "  Kiểm tra alert policy:"
+  info   "Inspect alert policies:"
   step "gcloud alpha monitoring policies list --project=$PROJECT_ID \\"
   step "  --format='table(displayName,enabled,conditions[0].displayName)'"
   echo ""
-  echo "  Kiểm tra notification channels:"
+  info   "Inspect notification channels:"
   step "gcloud alpha monitoring channels list --project=$PROJECT_ID \\"
   step "  --format='table(displayName,type,labels)'"
   echo ""
-  echo "  Nếu policy bị disabled:"
+  info   "If disabled:"
   step "gcloud alpha monitoring policies update POLICY_ID --enabled"
   echo ""
-  echo "  Verify email channel hoạt động:"
-  step "Vào: https://console.cloud.google.com/monitoring/alerting?project=$PROJECT_ID"
-  step "Kiểm tra: CIS 2.4 — Project Ownership Change Alert đang ENABLED"
-  step "Test notification: Send test notification"
+  info   "Verify via Console:"
+  step "https://console.cloud.google.com/monitoring/alerting?project=$PROJECT_ID"
+  step "Find: CIS 2.4 — Project Ownership Change Alert"
+  step "Confirm: status=ENABLED, notification channel=active"
   echo ""
-  C_STEPS="${C_STEPS}CIS 2.4: Verify alert policy enabled and notification channel working\n"
+  C_STEPS="${C_STEPS}CIS-2.4: Verify alert policy enabled and notification channel active\n"
 fi
 
 # ── CIS 3.3 — DNSSEC ─────────────────────────────────────────────
 if needs_fix "3.3"; then
-  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-  manual "CIS 3.3 — DNSSEC cho Cloud DNS zones"
-  echo "  Lý do không tự động: Cần terraform apply để đồng bộ state"
+  echo "────────────────────────────────────────────────────────────"
+  manual "CIS-3.3  DNSSEC for Cloud DNS zones"
+  info   "Reason:  Requires terraform apply to sync state correctly"
   echo ""
-  echo "  Kiểm tra DNS zones hiện tại:"
+  info   "Inspect current DNS zones:"
   step "gcloud dns managed-zones list --project=$PROJECT_ID \\"
   step "  --format='table(name,dnsName,dnssecConfig.state)'"
   echo ""
-  echo "  Fix qua Terraform (khuyến nghị):"
-  step "Sửa terraform/vpc.tf:"
+  info   "Option 1 — Terraform (recommended):"
+  step "Edit terraform/vpc.tf:"
   step "  resource \"google_dns_managed_zone\" \"public\" {"
   step "    dnssec_config { state = \"on\" }"
   step "  }"
-  step "Rồi: git add . && git commit -m 'fix: enable DNSSEC' && git push"
-  step "WF3 sẽ tự apply"
+  step "git add . && git commit -m 'fix: enable DNSSEC' && git push"
+  step "WF3 will apply automatically"
   echo ""
-  echo "  Fix trực tiếp (nếu khẩn cấp):"
+  info   "Option 2 — Direct CLI (emergency only):"
   step "gcloud dns managed-zones update ZONE_NAME \\"
   step "  --dnssec-state=on --project=$PROJECT_ID"
   echo ""
-  C_STEPS="${C_STEPS}CIS 3.3: Enable DNSSEC in vpc.tf and terraform apply\n"
+  C_STEPS="${C_STEPS}CIS-3.3: Enable DNSSEC in vpc.tf and push to trigger WF3\n"
 fi
 
-# ── CIS 3.6 — SSH 0.0.0.0/0 ─────────────────────────────────────
+# ── CIS 3.6 — SSH not open to 0.0.0.0/0 ─────────────────────────
 if needs_fix "3.6"; then
-  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-  manual "CIS 3.6 — SSH không mở 0.0.0.0/0"
-  echo "  Lý do không tự động: Cần biết IP hợp lệ của người dùng trước khi xóa rule"
-  echo "  Cảnh báo: Nếu xóa nhầm rule có thể mất SSH access vào VM"
+  echo "────────────────────────────────────────────────────────────"
+  manual "CIS-3.6  SSH firewall rule open to 0.0.0.0/0"
+  info   "Reason:  Need to confirm authorized IPs before restricting"
+  info   "WARNING: Incorrect update may cause loss of SSH access"
   echo ""
-  echo "  Kiểm tra SSH rules hiện tại:"
+  info   "Inspect current SSH rules:"
   step "gcloud compute firewall-rules list --project=$PROJECT_ID \\"
   step "  --filter='allowed[].ports=22' \\"
   step "  --format='table(name,sourceRanges,targetTags)'"
   echo ""
-  echo "  IP của bạn hiện tại:"
+  info   "Get your current public IP:"
   step "curl -s ifconfig.me"
   echo ""
-  echo "  Fix (thay YOUR_IP bằng IP thực):"
-  step "# Bước 1: Tìm tên rule SSH"
-  step "gcloud compute firewall-rules list --project=$PROJECT_ID \\"
-  step "  --filter='name~ssh AND allowed[].ports=22'"
-  echo ""
-  step "# Bước 2: Update rule với IP cụ thể"
-  step "gcloud compute firewall-rules update benchmark-allow-ssh \\"
+  info   "Remediate (replace YOUR_IP with actual IP):"
+  step "gcloud compute firewall-rules update benchmark-allow-ssh-bastion \\"
   step "  --source-ranges=$ALLOWED_CLIENT_CIDR \\"
   step "  --project=$PROJECT_ID"
   echo ""
-  step "# Hoặc sửa trong terraform.tfvars:"
-  step "  allowed_client_cidr = \"$ALLOWED_CLIENT_CIDR\""
-  step "Rồi push để WF3 apply"
+  info   "Or update terraform.tfvars:"
+  step "allowed_client_cidr = \"$ALLOWED_CLIENT_CIDR\""
+  step "Then push to trigger WF3"
   echo ""
-  C_STEPS="${C_STEPS}CIS 3.6: Update SSH firewall rule source from 0.0.0.0/0 to specific IP: $ALLOWED_CLIENT_CIDR\n"
+  C_STEPS="${C_STEPS}CIS-3.6: Restrict SSH source to specific IP: $ALLOWED_CLIENT_CIDR\n"
 fi
 
 # ── Summary ───────────────────────────────────────────────────────
-echo "================================================================"
-echo "  Nhóm C Summary"
-echo "  Manual actions cần làm: $C_COUNT"
-echo "================================================================"
-
+echo "════════════════════════════════════════════════════════════"
+echo " RESULT   Group C Manual Guidance"
+printf "          Manual actions required: %s\n" "$C_COUNT"
 if [ $C_COUNT -gt 0 ]; then
-  echo ""
-  echo "  Tóm tắt việc cần làm:"
-  echo -e "$C_STEPS" | while read line; do
-    [ -n "$line" ] && echo "  • $line"
+  echo "────────────────────────────────────────────────────────────"
+  echo " ACTIONS  Required steps:"
+  echo -e "$C_STEPS" | while IFS= read -r line; do
+    [ -n "$line" ] && echo "          - $line"
   done
 fi
+echo "════════════════════════════════════════════════════════════"
 
-echo "C_COUNT=$C_COUNT"     >> "${GITHUB_ENV:-/dev/null}" 2>/dev/null || true
-echo "C_STEPS=$C_STEPS"     >> "${GITHUB_ENV:-/dev/null}" 2>/dev/null || true
-
-# Nhóm C không fail dù có manual steps — đây là expected behavior
+echo "C_COUNT=$C_COUNT" >> "${GITHUB_ENV:-/dev/null}" 2>/dev/null || true
 exit 0

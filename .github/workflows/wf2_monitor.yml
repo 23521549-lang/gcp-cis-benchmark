@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       notify_on_pass:
-        description: 'Gửi email ngay cả khi PASS'
+        description: 'Send notification even when fully compliant'
         type: boolean
         default: false
 
@@ -42,25 +42,32 @@ jobs:
         with:
           project_id: ${{ env.PROJECT_ID }}
 
-      - name: "[Phase 0] Thu thập thông tin hiện tại"
+      - name: "Phase 0 | Collect System Information"
         run: |
+          echo "##[group]Phase 0: System Information Collection"
           chmod +x ${{ env.SCRIPTS_DIR }}/collect_info.sh
           REGION=${{ env.REGION }} \
             ${{ env.SCRIPTS_DIR }}/collect_info.sh /tmp || true
+          echo "##[endgroup]"
 
-      - name: Tải baseline từ GCS
+      - name: "Baseline | Load from GCS"
         run: |
+          echo "##[group]Baseline: Load from GCS"
           gsutil cp \
             gs://${{ env.TF_STATE_BUCKET }}/baseline/cis_baseline_latest.json \
             /tmp/cis_baseline_latest.json 2>/dev/null \
+            && echo "OK       Baseline loaded from GCS" \
             && echo "BASELINE_LOADED=true"  >> $GITHUB_ENV \
-            || echo "BASELINE_LOADED=false" >> $GITHUB_ENV
+            || { echo "##[warning]Baseline not found in GCS"; \
+                 echo "BASELINE_LOADED=false" >> $GITHUB_ENV; }
           gsutil cp \
             gs://${{ env.TF_STATE_BUCKET }}/baseline/iam_baseline_latest.json \
             /tmp/iam_baseline_latest.json 2>/dev/null || true
+          echo "##[endgroup]"
 
-      - name: "[Phase 2a] CIS compliance check (29 controls)"
+      - name: "Phase 2a | CIS Compliance Check (29 controls)"
         run: |
+          echo "##[group]Phase 2a: CIS Compliance Check — 29 Controls, 6 Domains"
           chmod +x ${{ env.SCRIPTS_DIR }}/cis_full_check.sh
           cd ${{ env.SCRIPTS_DIR }}
           set +e
@@ -78,19 +85,21 @@ jobs:
               && echo "REGRESSION=true"  >> $GITHUB_ENV \
               || echo "REGRESSION=false" >> $GITHUB_ENV
           else
-            echo "CIS_PASS=0"       >> $GITHUB_ENV
-            echo "CIS_FAIL=99"      >> $GITHUB_ENV
-            echo "CIS_RATE=0"       >> $GITHUB_ENV
-            echo "REGRESSION=true"  >> $GITHUB_ENV
+            echo "CIS_PASS=0"      >> $GITHUB_ENV
+            echo "CIS_FAIL=99"     >> $GITHUB_ENV
+            echo "CIS_RATE=0"      >> $GITHUB_ENV
+            echo "REGRESSION=true" >> $GITHUB_ENV
           fi
+          echo "##[endgroup]"
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "~> 1.7"
 
-      - name: "[Phase 2b] Terraform drift detection"
+      - name: "Phase 2b | Terraform Drift Detection"
         run: |
+          echo "##[group]Phase 2b: Terraform Drift Detection"
           cd ${{ env.TF_DIR }}
           terraform init -upgrade -input=false -no-color 2>/dev/null
           set +e
@@ -100,7 +109,6 @@ jobs:
             -var="allowed_client_cidr=${{ secrets.ALLOWED_CLIENT_CIDR }}" \
             -detailed-exitcode -input=false -no-color \
             2>&1 | tee /tmp/drift_check.txt
-          # FIX: dùng PIPESTATUS[0] thay vì $? để lấy exit code của terraform
           DRIFT_EXIT=${PIPESTATUS[0]}
           set -e
 
@@ -108,41 +116,43 @@ jobs:
 
           if [ "$DRIFT_EXIT" -eq 2 ]; then
             echo "DRIFT_DETECTED=true" >> $GITHUB_ENV
-            # Đếm số resource bị drift
             DRIFT_COUNT=$(grep -cE "will be (created|updated|destroyed)|must be replaced|has been deleted" \
               /tmp/drift_check.txt 2>/dev/null || echo "0")
             echo "DRIFT_COUNT=$DRIFT_COUNT" >> $GITHUB_ENV
-            echo "⚠ DRIFT DETECTED — $DRIFT_COUNT resource(s) bị thay đổi ngoài Terraform"
-            # In ra danh sách resource bị drift
-            grep -E "# .+ (will be|must be|has been)" /tmp/drift_check.txt \
-              | head -10 || true
+            echo "##[warning]Infrastructure drift detected — $DRIFT_COUNT resource(s) changed outside Terraform"
+            grep -E "# .+ (will be|must be|has been)" /tmp/drift_check.txt | head -10 || true
           elif [ "$DRIFT_EXIT" -eq 0 ]; then
             echo "DRIFT_DETECTED=false" >> $GITHUB_ENV
             echo "DRIFT_COUNT=0"        >> $GITHUB_ENV
-            echo "✓ No drift"
+            echo "OK       No infrastructure drift detected"
           else
             echo "DRIFT_DETECTED=false" >> $GITHUB_ENV
             echo "DRIFT_COUNT=0"        >> $GITHUB_ENV
-            echo "⚠ Terraform plan error (exit: $DRIFT_EXIT) — xem log chi tiết"
+            echo "##[warning]Terraform plan error (exit: $DRIFT_EXIT)"
           fi
+          echo "##[endgroup]"
         continue-on-error: true
 
-      - name: "[Phase 2c] IAM anomaly detection"
+      - name: "Phase 2c | IAM Anomaly Detection"
         run: |
+          echo "##[group]Phase 2c: IAM Anomaly Detection"
           python3 ${{ env.SCRIPTS_DIR }}/python/iam_diff.py \
-            && echo "IAM_ANOMALY=false" >> $GITHUB_ENV \
-            || echo "IAM_ANOMALY=true"  >> $GITHUB_ENV
+            && { echo "OK       IAM bindings unchanged from baseline"; \
+                 echo "IAM_ANOMALY=false" >> $GITHUB_ENV; } \
+            || { echo "##[warning]IAM anomaly detected — new bindings outside baseline"; \
+                 echo "IAM_ANOMALY=true" >> $GITHUB_ENV; }
+          echo "##[endgroup]"
         env:
           IAM_BASELINE: /tmp/iam_baseline_latest.json
           IAM_CURRENT:  /tmp/iam_snapshot.json
         continue-on-error: true
 
-      - name: "Phân loại kết quả & quyết định"
+      - name: "Analysis | Evaluate Compliance Status"
         run: |
+          echo "##[group]Analysis: Compliance Status Evaluation"
           ACTION="NONE"
           TRIGGER_REASON=""
 
-          # Drift hoặc IAM anomaly — ưu tiên cao nhất
           if [ "${{ env.DRIFT_DETECTED }}" = "true" ]; then
             ACTION="URGENT"
             TRIGGER_REASON="WF2_DRIFT"
@@ -151,37 +161,34 @@ jobs:
             ACTION="URGENT"
             TRIGGER_REASON="${TRIGGER_REASON:+$TRIGGER_REASON,}WF2_IAM_ANOMALY"
           fi
-
-          # Regression
           if [ "${{ env.REGRESSION }}" = "true" ]; then
             [ "$ACTION" = "NONE" ] && ACTION="RECOVERY"
             TRIGGER_REASON="${TRIGGER_REASON:+$TRIGGER_REASON,}CIS_REGRESSION:${{ env.CIS_FAIL }}"
           fi
 
-          # BẤT KỲ FAIL nào cũng trigger WF4
           CIS_FAIL="${{ env.CIS_FAIL }}"
           if [ "${CIS_FAIL:-0}" -gt 0 ] && [ "$ACTION" = "NONE" ]; then
             ACTION="RECOVERY"
-            TRIGGER_REASON="CIS_FAIL:${CIS_FAIL}controls"
+            TRIGGER_REASON="CIS_FAIL:${CIS_FAIL}"
           fi
 
-          echo "ACTION=$ACTION"               >> $GITHUB_ENV
+          echo "ACTION=$ACTION"                >> $GITHUB_ENV
           echo "TRIGGER_REASON=$TRIGGER_REASON" >> $GITHUB_ENV
-          echo "WF2_TF_FAILED=false"          >> $GITHUB_ENV
-          echo "WF2_ERROR_TYPE=NONE"          >> $GITHUB_ENV
+          echo "WF2_TF_FAILED=false"            >> $GITHUB_ENV
+          echo "WF2_ERROR_TYPE=NONE"            >> $GITHUB_ENV
 
-          echo "============================================"
-          echo "  COMPLIANCE : ${{ env.CIS_RATE }}%"
-          echo "  FAIL       : ${{ env.CIS_FAIL }}"
-          echo "  REGRESSION : ${{ env.REGRESSION }}"
-          echo "  DRIFT      : ${{ env.DRIFT_DETECTED }}"
-          echo "  IAM ANOMALY: ${{ env.IAM_ANOMALY }}"
-          echo "  ACTION     : $ACTION"
-          echo "  REASON     : $TRIGGER_REASON"
-          echo "============================================"
+          echo "INFO     Compliance  : ${{ env.CIS_RATE }}%"
+          echo "INFO     Controls    : ${{ env.CIS_PASS }} pass / ${{ env.CIS_FAIL }} fail"
+          echo "INFO     Regression  : ${{ env.REGRESSION }}"
+          echo "INFO     Drift       : ${{ env.DRIFT_DETECTED }}"
+          echo "INFO     IAM Anomaly : ${{ env.IAM_ANOMALY }}"
+          echo "INFO     Action      : $ACTION"
+          echo "INFO     Reason      : ${TRIGGER_REASON:-none}"
+          echo "##[endgroup]"
 
-      - name: Lưu compliance history
+      - name: "History | Save Compliance Record"
         run: |
+          echo "##[group]History: Save Compliance Record to GCS"
           TIMESTAMP=$(date -u +%Y%m%d_%H%M%S)
           TIMESTAMP=$TIMESTAMP \
           TRIGGER=WF2_scheduled \
@@ -191,20 +198,23 @@ jobs:
 
           gsutil cp /tmp/history_${TIMESTAMP}.json \
             gs://${{ env.TF_STATE_BUCKET }}/compliance_history/${TIMESTAMP}.json \
-            2>/dev/null || echo "[WARN] GCS upload failed"
+            2>/dev/null \
+            && echo "OK       History saved: ${TIMESTAMP}.json" \
+            || echo "##[warning]Failed to upload compliance history to GCS"
+          echo "##[endgroup]"
 
-      - name: Upload artifacts
+      - name: "Artifacts | Upload Reports"
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: cis-monitor-${{ github.run_number }}
+          name: wf2-monitor-report-${{ github.run_number }}
           path: |
             /tmp/cis_report.json
             /tmp/context_info.json
             /tmp/drift_check.txt
           retention-days: 30
 
-      - name: "Trigger WF4 Recovery"
+      - name: "WF4 | Trigger Recovery Pipeline"
         if: env.ACTION != 'NONE'
         uses: actions/github-script@v7
         with:
@@ -222,18 +232,26 @@ jobs:
                 trigger_reason: process.env.TRIGGER_REASON || 'WF2',
               }
             });
-            console.log('WF4 triggered:', process.env.ACTION);
+            console.log('[WF2] WF4 triggered — action:', process.env.ACTION);
 
-      - name: Summary
+      - name: "Summary | Monitor Report"
         if: always()
         run: |
-          echo "============================================"
-          echo "  WF2 Monitor Summary"
-          echo "  Rate   : ${{ env.CIS_RATE }}%"
-          echo "  PASS   : ${{ env.CIS_PASS }}"
-          echo "  FAIL   : ${{ env.CIS_FAIL }}"
-          echo "  Drift  : ${{ env.DRIFT_DETECTED }}"
-          echo "  IAM    : ${{ env.IAM_ANOMALY }}"
-          echo "  Action : ${{ env.ACTION }}"
-          echo "  Reason : ${{ env.TRIGGER_REASON }}"
-          echo "============================================"
+          echo "##[group]WF2 Monitor Summary"
+          echo "────────────────────────────────────────────────"
+          echo " WF2  Scheduled CIS Monitor"
+          echo " Run  #${{ github.run_number }} | $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          echo "────────────────────────────────────────────────"
+          echo " CIS Benchmark"
+          echo "   Rate       : ${{ env.CIS_RATE }}%"
+          echo "   Pass       : ${{ env.CIS_PASS }}/29"
+          echo "   Fail       : ${{ env.CIS_FAIL }}"
+          echo "   Regression : ${{ env.REGRESSION }}"
+          echo " Infrastructure"
+          echo "   Drift      : ${{ env.DRIFT_DETECTED }}"
+          echo "   IAM Anomaly: ${{ env.IAM_ANOMALY }}"
+          echo " Action"
+          echo "   Decision   : ${{ env.ACTION }}"
+          echo "   Reason     : ${{ env.TRIGGER_REASON }}"
+          echo "────────────────────────────────────────────────"
+          echo "##[endgroup]"

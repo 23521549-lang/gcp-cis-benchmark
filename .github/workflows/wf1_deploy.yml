@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: "Chỉ plan, không apply"
+        description: "Plan only, no apply"
         type: boolean
         default: false
 
@@ -41,81 +41,68 @@ jobs:
         with:
           project_id: ${{ env.PROJECT_ID }}
 
-      - name: "[Phase 0] Thu thập thông tin hệ thống"
+      - name: "Phase 0 | Collect System Information"
         run: |
+          echo "##[group]Phase 0: System Information Collection"
           chmod +x ${{ env.SCRIPTS_DIR }}/collect_info.sh
           REGION=${{ env.REGION }} \
             ${{ env.SCRIPTS_DIR }}/collect_info.sh /tmp || true
-          echo "=== Context Info ===" && cat /tmp/context_info.json 2>/dev/null || true
+          echo "##[endgroup]"
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "~> 1.7"
 
-      - name: Terraform Init
+      - name: "Terraform | Initialize"
         working-directory: ${{ env.TF_DIR }}
         run: terraform init -upgrade
 
-      - name: Terraform Validate
+      - name: "Terraform | Validate Configuration"
         working-directory: ${{ env.TF_DIR }}
         run: terraform validate
 
-      # ── BƯỚC 1: Auto-unlock state lock ──────────────────────────
-      - name: "Auto-unlock Terraform state nếu bị stuck"
+      - name: "Terraform | Auto-unlock State Lock"
         working-directory: ${{ env.TF_DIR }}
         run: |
+          echo "##[group]Terraform: State Lock Check"
           LOCK_FILE="gs://${{ env.TF_STATE_BUCKET }}/terraform/state/default.tflock"
 
           LOCK_EXISTS=$(gsutil stat "$LOCK_FILE" 2>/dev/null && echo "true" || echo "false")
           if [ "$LOCK_EXISTS" = "false" ]; then
-            echo "✓ Không có state lock — tiếp tục"
+            echo "INFO     No state lock detected"
+            echo "##[endgroup]"
             exit 0
           fi
 
           LOCK_INFO=$(gsutil cat "$LOCK_FILE" 2>/dev/null || echo "{}")
-          
-          LOCK_CREATED=$(python3 - "$LOCK_INFO" <<'PY'
-          import json, sys
-
-          try:
-              d = json.loads(sys.argv[1])
-              print(d.get('Created', ''))
-          except:
-              print('')
-          PY
-          )
-
-          echo "⚠ Phát hiện state lock — Created: $LOCK_CREATED"
+          LOCK_CREATED=$(echo "$LOCK_INFO" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('Created',''))" 2>/dev/null || echo "")
+          echo "WARN     State lock detected — Created: $LOCK_CREATED"
 
           AGE_MINUTES=999
           if [ -n "$LOCK_CREATED" ]; then
             LOCK_TS=$(date -d "$LOCK_CREATED" +%s 2>/dev/null || echo "0")
             NOW_TS=$(date +%s)
             [ "$LOCK_TS" -gt 0 ] && AGE_MINUTES=$(( (NOW_TS - LOCK_TS) / 60 ))
-            echo "  Lock age: ${AGE_MINUTES} phút"
+            echo "INFO     Lock age: ${AGE_MINUTES} minutes"
           fi
 
           if [ "$AGE_MINUTES" -gt 15 ]; then
-            echo "  Lock quá ${AGE_MINUTES} phút — xóa tự động..."
+            echo "INFO     Lock age exceeds 15 minutes — removing stale lock"
             gsutil rm "$LOCK_FILE" 2>/dev/null \
-              && echo "  [OK] State lock đã xóa" \
-              || echo "  [WARN] Không xóa được lock"
+              && echo "OK       State lock removed" \
+              || echo "##[warning]Failed to remove state lock"
           else
-            echo "  Lock mới ${AGE_MINUTES} phút — chờ với -lock-timeout=120s"
+            echo "INFO     Lock is recent — waiting with -lock-timeout=120s"
           fi
+          echo "##[endgroup]"
         continue-on-error: true
 
-      # ── BƯỚC 2: Auto-import TRƯỚC plan ──────────────────────────
-      # Phải import trước để tránh lỗi "Saved plan is stale"
-      # (import thay đổi state → plan cũ không còn hợp lệ)
-      - name: "Auto-import existing resources vào Terraform state"
+      - name: "Terraform | Auto-import Existing Resources"
         if: ${{ !inputs.dry_run }}
         working-directory: ${{ env.TF_DIR }}
         run: |
-          echo "================================================================"
-          echo "  Auto-import: tránh lỗi 409 conflict"
-          echo "================================================================"
+          echo "##[group]Terraform: Auto-import (prevent 409 conflict)"
 
           export TF_VAR_db_username="${{ secrets.DB_USERNAME }}"
           export TF_VAR_db_password="${{ secrets.DB_PASSWORD }}"
@@ -124,12 +111,12 @@ jobs:
           import_if_missing() {
             local resource="$1" gcp_id="$2" desc="$3"
             if terraform state show "$resource" &>/dev/null 2>&1; then
-              echo "  [SKIP] $desc — đã có trong state"
+              echo "SKIP     $desc — already in state"
             else
-              echo "  [IMPORT] $desc..."
+              echo "RUN      Importing: $desc"
               terraform import "$resource" "$gcp_id" 2>&1 \
-                && echo "  [OK] Imported: $desc" \
-                || echo "  [WARN] Không import được (có thể chưa tồn tại): $desc"
+                && echo "OK       Imported: $desc" \
+                || echo "##[warning]Import failed (may not exist yet): $desc"
             fi
           }
 
@@ -137,80 +124,63 @@ jobs:
           REGION=${{ env.REGION }}
           ZONE=${{ env.VM_ZONE }}
 
-          # KMS KeyRing
-          import_if_missing \
-            "google_kms_key_ring.my_keyring" \
+          import_if_missing "google_kms_key_ring.my_keyring" \
             "projects/${PROJECT}/locations/${REGION}/keyRings/benchmark-keyring" \
             "KMS KeyRing: benchmark-keyring"
 
-          # KMS Crypto Key
-          import_if_missing \
-            "google_kms_crypto_key.my_crypto_key" \
+          import_if_missing "google_kms_crypto_key.my_crypto_key" \
             "projects/${PROJECT}/locations/${REGION}/keyRings/benchmark-keyring/cryptoKeys/benchmark-crypto-key" \
-            "KMS Crypto Key: benchmark-crypto-key"
+            "KMS CryptoKey: benchmark-crypto-key"
 
-          # Storage bucket — thử các tên phổ biến
           for BNAME in \
             "benchmark-storage-v2-${PROJECT}" \
             "benchmark-storage-${PROJECT}" \
             "benchmark-storage-3a51a40b-8c9e-4126-804" \
             "benchmark-storage-v2-3a51a40b-8c9e-4126-804"; do
             if gsutil ls "gs://${BNAME}" &>/dev/null 2>&1; then
-              import_if_missing \
-                "google_storage_bucket.log_bucket" \
-                "$BNAME" \
-                "Storage bucket: $BNAME"
+              import_if_missing "google_storage_bucket.log_bucket" "$BNAME" \
+                "Storage Bucket: $BNAME"
               break
             fi
           done
 
-          # API Key
           API_KEY_ID=$(gcloud alpha services api-keys list \
-            --project="$PROJECT" \
-            --format="value(name)" \
-            --filter="displayName:Restricted" \
-            2>/dev/null | head -1 || echo "")
+            --project="$PROJECT" --format="value(name)" \
+            --filter="displayName:Restricted" 2>/dev/null | head -1 || echo "")
           [ -n "$API_KEY_ID" ] && import_if_missing \
-            "google_apikeys_key.restricted_api_key" \
-            "$API_KEY_ID" \
-            "API Key: restricted-app-key"
+            "google_apikeys_key.restricted_api_key" "$API_KEY_ID" "API Key: restricted-app-key"
 
-          # Log Sink
           SINK_EXISTS=$(gcloud logging sinks list \
-            --project="$PROJECT" \
-            --filter="name=benchmark-log-sink" \
+            --project="$PROJECT" --filter="name=benchmark-log-sink" \
             --format="value(name)" 2>/dev/null || echo "")
           [ -n "$SINK_EXISTS" ] && import_if_missing \
             "google_logging_project_sink.log_sink" \
-            "projects/${PROJECT}/sinks/benchmark-log-sink" \
-            "Log Sink: benchmark-log-sink"
+            "projects/${PROJECT}/sinks/benchmark-log-sink" "Log Sink: benchmark-log-sink"
 
-          # VM
           VM_EXISTS=$(gcloud compute instances describe benchmark-vm-01 \
             --zone="$ZONE" --project="$PROJECT" \
             --format="value(name)" 2>/dev/null || echo "")
           [ -n "$VM_EXISTS" ] && import_if_missing \
             "google_compute_instance.vm" \
-            "projects/${PROJECT}/zones/${ZONE}/instances/benchmark-vm-01" \
-            "VM: benchmark-vm-01"
+            "projects/${PROJECT}/zones/${ZONE}/instances/benchmark-vm-01" "VM: benchmark-vm-01"
 
-          # Grant serviceAccountUser
-          echo "  Kiểm tra quyền serviceAccountUser..."
+          echo "RUN      Verifying serviceAccountUser permission..."
           gcloud iam service-accounts add-iam-policy-binding \
             "app-least-privilege-sa@${PROJECT}.iam.gserviceaccount.com" \
             --member="serviceAccount:github-actions-sa@${PROJECT}.iam.gserviceaccount.com" \
             --role="roles/iam.serviceAccountUser" \
             --project="$PROJECT" --quiet 2>/dev/null \
-            && echo "  [OK] serviceAccountUser granted" \
-            || echo "  [WARN] serviceAccountUser — đã có hoặc không cần"
+            && echo "OK       serviceAccountUser permission verified" \
+            || echo "INFO     serviceAccountUser already exists or not required"
 
-          echo "  Auto-import hoàn tất"
+          echo "INFO     Auto-import completed"
+          echo "##[endgroup]"
         continue-on-error: true
 
-      # ── BƯỚC 3: Plan SAU import ──────────────────────────────────
-      - name: Terraform Plan
+      - name: "Terraform | Plan"
         working-directory: ${{ env.TF_DIR }}
         run: |
+          echo "##[group]Terraform: Plan"
           set +e
           terraform plan \
             -var="db_username=${{ secrets.DB_USERNAME }}" \
@@ -225,21 +195,21 @@ jobs:
           echo "PLAN_EXIT=$PLAN_EXIT" >> $GITHUB_ENV
           if [ $PLAN_EXIT -ne 0 ]; then
             echo "TF_PLAN_FAILED=true" >> $GITHUB_ENV
-            echo "⚠ Terraform Plan FAILED"
+            echo "##[error]Terraform plan failed (exit: $PLAN_EXIT)"
             tail -20 /tmp/tf_plan.txt
           else
             echo "TF_PLAN_FAILED=false" >> $GITHUB_ENV
-            echo "✓ Terraform Plan OK"
+            echo "OK       Terraform plan completed successfully"
           fi
+          echo "##[endgroup]"
 
-      # ── BƯỚC 4: Apply ────────────────────────────────────────────
-      - name: Terraform Apply
+      - name: "Terraform | Apply"
         if: ${{ !inputs.dry_run && env.TF_PLAN_FAILED == 'false' }}
         working-directory: ${{ env.TF_DIR }}
         run: |
+          echo "##[group]Terraform: Apply"
           set +e
-          terraform apply -auto-approve \
-            -lock-timeout=120s \
+          terraform apply -auto-approve -lock-timeout=120s \
             tfplan 2>&1 | tee /tmp/tf_apply.txt
           APPLY_EXIT=$?
           set -e
@@ -254,27 +224,29 @@ jobs:
             grep -qiE "timeout|deadline exceeded"                /tmp/tf_apply.txt && ERROR_TYPE="TF_TIMEOUT"
             grep -qiE "stale|state was changed"                  /tmp/tf_apply.txt && ERROR_TYPE="TF_STALE_PLAN"
             echo "TF_ERROR_TYPE=$ERROR_TYPE" >> $GITHUB_ENV
-            echo "⚠ Terraform Apply FAILED (exit: $APPLY_EXIT) — $ERROR_TYPE"
+            echo "##[error]Terraform apply failed (exit: $APPLY_EXIT) — $ERROR_TYPE"
             tail -20 /tmp/tf_apply.txt
           else
             echo "TF_FAILED=false"    >> $GITHUB_ENV
             echo "TF_ERROR_TYPE=NONE" >> $GITHUB_ENV
-            echo "✓ Terraform Apply SUCCESS"
+            echo "OK       Terraform apply completed successfully"
           fi
+          echo "##[endgroup]"
         continue-on-error: true
 
-      - name: Terraform Apply (khi Plan bị lỗi)
+      - name: "Terraform | Skip Apply (Plan Failed)"
         if: ${{ !inputs.dry_run && env.TF_PLAN_FAILED == 'true' }}
         run: |
           echo "TF_FAILED=true"           >> $GITHUB_ENV
           echo "TF_ERROR_TYPE=TF_UNKNOWN" >> $GITHUB_ENV
-          echo "⚠ Terraform Plan đã thất bại — bỏ qua Apply"
+          echo "##[warning]Plan failed — apply skipped"
 
-      - name: Wait for resources to stabilize
+      - name: "Wait | Resource Propagation (30s)"
         run: sleep 30
 
-      - name: "CIS Full Check (29 controls)"
+      - name: "CIS | Full Compliance Check (29 controls)"
         run: |
+          echo "##[group]CIS Benchmark: Full Check — 29 Controls, 6 Domains"
           chmod +x ${{ env.SCRIPTS_DIR }}/cis_full_check.sh
           cd ${{ env.SCRIPTS_DIR }}
           set +e
@@ -292,30 +264,34 @@ jobs:
             echo "CIS_FAIL=99" >> $GITHUB_ENV
             echo "CIS_RATE=0"  >> $GITHUB_ENV
           fi
+          echo "##[endgroup]"
 
-      - name: "[Phase 1] Lưu golden baseline"
+      - name: "Phase 1 | Save Golden Baseline"
         if: env.CIS_EXIT == '0' && env.TF_FAILED != 'true' && !inputs.dry_run
         env:
           TF_STATE_BUCKET: ${{ env.TF_STATE_BUCKET }}
         run: |
+          echo "##[group]Phase 1: Baseline Snapshot"
           chmod +x ${{ env.SCRIPTS_DIR }}/baseline/init_baseline.sh
           ${{ env.SCRIPTS_DIR }}/baseline/init_baseline.sh \
             /tmp/cis_report.json WF1 /tmp/context_info.json || true
+          echo "##[endgroup]"
 
-      - name: Upload artifacts
+      - name: "Artifacts | Upload Reports"
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: cis-deploy-report-${{ github.run_number }}
+          name: wf1-deploy-report-${{ github.run_number }}
           path: |
             /tmp/cis_report.json
             /tmp/tf_apply.txt
             /tmp/context_info.json
           retention-days: 30
 
-      - name: "Quyết định trigger WF4"
+      - name: "WF4 | Evaluate Trigger Conditions"
         if: always() && !inputs.dry_run
         run: |
+          echo "##[group]WF4 Trigger Evaluation"
           TRIGGER_WF4=false
           TRIGGER_REASON=""
 
@@ -332,14 +308,14 @@ jobs:
 
           echo "TRIGGER_WF4=$TRIGGER_WF4"       >> $GITHUB_ENV
           echo "TRIGGER_REASON=$TRIGGER_REASON" >> $GITHUB_ENV
-          echo "================================"
-          echo "  TRIGGER_WF4 : $TRIGGER_WF4"
-          echo "  REASON      : $TRIGGER_REASON"
-          echo "  TF_FAILED   : ${{ env.TF_FAILED }}"
-          echo "  CIS_FAIL    : ${{ env.CIS_FAIL }}"
-          echo "================================"
 
-      - name: "Trigger WF4 Recovery"
+          echo "INFO     Trigger WF4 : $TRIGGER_WF4"
+          echo "INFO     Reason      : ${TRIGGER_REASON:-none}"
+          echo "INFO     TF Failed   : ${{ env.TF_FAILED }}"
+          echo "INFO     CIS Fail    : ${{ env.CIS_FAIL }}"
+          echo "##[endgroup]"
+
+      - name: "WF4 | Trigger Recovery Pipeline"
         if: always() && env.TRIGGER_WF4 == 'true' && !inputs.dry_run
         uses: actions/github-script@v7
         with:
@@ -357,18 +333,25 @@ jobs:
                 trigger_reason: process.env.TRIGGER_REASON || 'WF1',
               }
             });
-            console.log('WF4 triggered — reason:', process.env.TRIGGER_REASON);
+            console.log('[WF1] WF4 triggered — reason:', process.env.TRIGGER_REASON);
 
-      - name: Summary
+      - name: "Summary | Deployment Report"
         if: always()
         run: |
-          echo "================================================"
-          echo "  WF1 Deploy Summary"
-          echo "  TF_FAILED   : ${{ env.TF_FAILED }}"
-          echo "  TF_ERROR    : ${{ env.TF_ERROR_TYPE }}"
-          echo "  CIS PASS    : ${{ env.CIS_PASS }}"
-          echo "  CIS FAIL    : ${{ env.CIS_FAIL }}"
-          echo "  CIS RATE    : ${{ env.CIS_RATE }}%"
-          echo "  WF4 TRIGGER : ${{ env.TRIGGER_WF4 }}"
-          echo "  REASON      : ${{ env.TRIGGER_REASON }}"
-          echo "================================================"
+          echo "##[group]WF1 Deployment Summary"
+          echo "────────────────────────────────────────────────"
+          echo " WF1  Initial Deploy & Bootstrap"
+          echo " Run  #${{ github.run_number }} | $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          echo "────────────────────────────────────────────────"
+          echo " Terraform"
+          echo "   Status  : ${{ env.TF_FAILED == 'true' && 'FAILED' || 'SUCCESS' }}"
+          echo "   Error   : ${{ env.TF_ERROR_TYPE }}"
+          echo " CIS Benchmark"
+          echo "   Pass    : ${{ env.CIS_PASS }}/29"
+          echo "   Fail    : ${{ env.CIS_FAIL }}"
+          echo "   Rate    : ${{ env.CIS_RATE }}%"
+          echo " Recovery"
+          echo "   WF4     : ${{ env.TRIGGER_WF4 }}"
+          echo "   Reason  : ${{ env.TRIGGER_REASON }}"
+          echo "────────────────────────────────────────────────"
+          echo "##[endgroup]"

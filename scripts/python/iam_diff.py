@@ -1,27 +1,24 @@
 #!/usr/bin/env python3
 """
-Phase 2c — IAM anomaly detection
-So sánh IAM snapshot hiện tại với baseline
-Exit 0 = không có anomaly
-Exit 1 = phát hiện binding mới
+iam_diff.py
+Phase 2c — IAM Anomaly Detection
+Compare current IAM snapshot against baseline
+Exit 0 = no anomaly detected
+Exit 1 = new bindings detected (possible unauthorized change)
 """
-import json, sys, os
+import json
+import sys
+import os
 
-baseline_file = os.environ.get('IAM_BASELINE', '/tmp/iam_baseline_latest.json')
-current_file  = os.environ.get('IAM_CURRENT',  '/tmp/iam_snapshot.json')
+BASELINE_FILE = os.environ.get('IAM_BASELINE', '/tmp/iam_baseline_latest.json')
+CURRENT_FILE  = os.environ.get('IAM_CURRENT',  '/tmp/iam_snapshot.json')
 
-if not os.path.exists(baseline_file):
-    print("[INFO] Baseline IAM chưa có — skip diff")
-    sys.exit(0)
+SEP = "────────────────────────────────────────────────────────────"
 
-if not os.path.exists(current_file):
-    print("[INFO] IAM snapshot hiện tại không có — skip diff")
-    sys.exit(0)
-
-with open(baseline_file) as f:
-    baseline = json.load(f)
-with open(current_file) as f:
-    current = json.load(f)
+def header(title):
+    print(SEP)
+    print(f" IAM-DIFF {title}")
+    print(SEP)
 
 def get_bindings(policy):
     result = set()
@@ -31,25 +28,45 @@ def get_bindings(policy):
             result.add(f"{m}|{role}")
     return result
 
+header("IAM Anomaly Detection")
+
+if not os.path.exists(BASELINE_FILE):
+    print("INFO     Baseline IAM not found — skipping diff")
+    print("         Run WF1 to create initial baseline")
+    sys.exit(0)
+
+if not os.path.exists(CURRENT_FILE):
+    print("INFO     Current IAM snapshot not found — skipping diff")
+    sys.exit(0)
+
+with open(BASELINE_FILE) as f:
+    baseline = json.load(f)
+with open(CURRENT_FILE) as f:
+    current = json.load(f)
+
 baseline_bindings = get_bindings(baseline)
 current_bindings  = get_bindings(current)
 new_bindings      = current_bindings - baseline_bindings
 removed_bindings  = baseline_bindings - current_bindings
 
 if new_bindings:
-    print("⚠ NEW BINDINGS (không có trong baseline):")
+    print(f"WARN     New bindings not in baseline: {len(new_bindings)}")
     for b in sorted(new_bindings):
         member, role = b.split('|', 1)
-        print(f"  + {member} -> {role}")
+        risk = "HIGH" if any(r in role for r in
+               ['owner','editor','admin','securityAdmin']) else "LOW"
+        print(f"         [{risk}] {member} -> {role}")
 
 if removed_bindings:
-    print("ℹ REMOVED BINDINGS (có trong baseline nhưng không còn):")
+    print(f"INFO     Removed bindings (in baseline, not in current): {len(removed_bindings)}")
     for b in sorted(removed_bindings):
         member, role = b.split('|', 1)
-        print(f"  - {member} -> {role}")
+        print(f"         [-] {member} -> {role}")
 
 if not new_bindings and not removed_bindings:
-    print("✓ IAM bindings không thay đổi so với baseline")
+    print("OK       IAM bindings unchanged from baseline")
+    print(f"         Total bindings: {len(current_bindings)}")
     sys.exit(0)
 
+print(SEP)
 sys.exit(1 if new_bindings else 0)

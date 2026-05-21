@@ -1,6 +1,7 @@
 #!/bin/bash
 # ================================================================
-# CIS GCP Benchmark v4.0.0 — FULL CHECK (29 controls, 6 domains)
+# cis_full_check.sh
+# CIS GCP Foundation Benchmark v4.0.0 — Full Compliance Check
 # Usage: ./cis_full_check.sh [text|json] [report_file] [baseline_file]
 # ================================================================
 set -uo pipefail
@@ -10,9 +11,6 @@ PROJECT_ID=$(gcloud config get-value project 2>/dev/null)
 OUTPUT_FORMAT="${1:-text}"
 REPORT_FILE="${2:-/tmp/cis_report_$(date +%Y%m%d_%H%M%S).json}"
 BASELINE_FILE="${3:-/tmp/cis_baseline_latest.json}"
-
-GREEN="\033[0;32m"; RED="\033[0;31m"; YELLOW="\033[0;33m"
-CYAN="\033[0;36m"; RESET="\033[0m"
 
 TOTAL_PASS=0; TOTAL_FAIL=0
 DOMAIN_RESULTS=()
@@ -25,12 +23,12 @@ run_domain_check() {
   local script="$3"
 
   echo ""
-  echo -e "${CYAN}════════════════════════════════════════════════════════════${RESET}"
-  echo -e "${CYAN}  DOMAIN $domain_num — $domain_name${RESET}"
-  echo -e "${CYAN}════════════════════════════════════════════════════════════${RESET}"
+  echo "════════════════════════════════════════════════════════════"
+  echo " CHECK    [D${domain_num}] ${domain_name}"
+  echo "════════════════════════════════════════════════════════════"
 
   if [ ! -f "$SCRIPT_DIR/$script" ]; then
-    echo -e "${RED}[ERROR]${RESET} Script không tìm thấy: $SCRIPT_DIR/$script"
+    echo "ERROR    Script not found: $SCRIPT_DIR/$script"
     DOMAIN_RESULTS+=("{\"domain\":$domain_num,\"name\":\"$domain_name\",\"status\":\"ERROR\",\"pass\":0,\"fail\":0}")
     return 1
   fi
@@ -46,7 +44,6 @@ run_domain_check() {
   TOTAL_PASS=$((TOTAL_PASS + D_PASS))
   TOTAL_FAIL=$((TOTAL_FAIL + D_FAIL))
 
-  # Trích control IDs bị FAIL — match dạng "2.2", "6.2.1", v.v.
   while IFS= read -r line; do
     if echo "$line" | grep -q "\[FAIL\]"; then
       CID=$(echo "$line" | grep -oP '\d+\.\d+(\.\d+)?' | head -1 || true)
@@ -59,17 +56,15 @@ run_domain_check() {
   DOMAIN_RESULTS+=("{\"domain\":$domain_num,\"name\":\"$domain_name\",\"status\":\"$STATUS\",\"pass\":$D_PASS,\"fail\":$D_FAIL}")
 }
 
-# ── Banner ────────────────────────────────────────────────────────
-echo -e "${CYAN}"
-echo "  ╔══════════════════════════════════════════════════════╗"
-echo "  ║     CIS GCP Foundation Benchmark v4.0.0              ║"
-echo "  ║     Full Compliance Check — 29 Controls, 6 Domains   ║"
-echo -e "  ║     Project: $PROJECT_ID"
-echo "  ╚══════════════════════════════════════════════════════╝"
-echo -e "${RESET}"
-echo "  Started: $(date '+%Y-%m-%d %H:%M:%S')"
+# ── Header ────────────────────────────────────────────────────────
+echo "════════════════════════════════════════════════════════════"
+echo " CIS GCP Foundation Benchmark v4.0.0"
+echo " Full Compliance Check — 29 Controls, 6 Domains"
+echo " Project : $PROJECT_ID"
+echo " Started : $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+echo "════════════════════════════════════════════════════════════"
 
-# ── Chạy 6 domain ────────────────────────────────────────────────
+# ── Run 6 domains ────────────────────────────────────────────────
 run_domain_check 1 "Identity & Access Management" "check_iam.sh"
 run_domain_check 2 "Logging & Monitoring"         "check_logging.sh"
 run_domain_check 3 "Networking"                   "check_networking.sh"
@@ -77,39 +72,54 @@ run_domain_check 4 "Virtual Machines"             "check_vm.sh"
 run_domain_check 5 "Storage"                      "check_storage.sh"
 run_domain_check 6 "Cloud SQL PostgreSQL"          "check_sql.sh"
 
-# ── Tổng kết ─────────────────────────────────────────────────────
+# ── Compliance summary ───────────────────────────────────────────
 TOTAL=$((TOTAL_PASS + TOTAL_FAIL))
 COMPLIANCE_PCT=0
 [ "$TOTAL" -gt 0 ] && COMPLIANCE_PCT=$(( (TOTAL_PASS * 100) / TOTAL ))
 
 echo ""
 echo "════════════════════════════════════════════════════════════"
-echo "  TỔNG KẾT CIS COMPLIANCE"
-echo "════════════════════════════════════════════════════════════"
+echo " RESULT   CIS Compliance Summary"
+echo "────────────────────────────────────────────────────────────"
+printf " %-10s %-6s %-6s %-6s %s\n" "Domain" "Pass" "Fail" "Total" "Status"
+echo " ──────────────────────────────────────────────────────────"
+for entry in "${DOMAIN_RESULTS[@]}"; do
+  D_NUM=$(echo "$entry" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['domain'])" 2>/dev/null)
+  D_NAME=$(echo "$entry" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['name'])" 2>/dev/null)
+  D_PASS=$(echo "$entry" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['pass'])" 2>/dev/null)
+  D_FAIL=$(echo "$entry" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['fail'])" 2>/dev/null)
+  D_STAT=$(echo "$entry" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['status'])" 2>/dev/null)
+  D_TOT=$((D_PASS + D_FAIL))
+  printf " D%-9s %-6s %-6s %-6s %s\n" "$D_NUM" "$D_PASS" "$D_FAIL" "$D_TOT" "$D_STAT"
+done
+echo " ──────────────────────────────────────────────────────────"
+printf " %-10s %-6s %-6s %-6s %s%%\n" "TOTAL" "$TOTAL_PASS" "$TOTAL_FAIL" "$TOTAL" "$COMPLIANCE_PCT"
+echo "────────────────────────────────────────────────────────────"
+
 if [ "$TOTAL_FAIL" -eq 0 ]; then
-  echo -e "  ${GREEN}✓ FULLY COMPLIANT: $TOTAL_PASS/$TOTAL PASS (100%)${RESET}"
+  echo " RESULT   COMPLIANT — All $TOTAL controls passing (100%)"
 else
-  echo -e "  ${GREEN}PASS: $TOTAL_PASS${RESET} | ${RED}FAIL: $TOTAL_FAIL${RESET} | Tổng: $TOTAL"
-  echo -e "  Compliance rate: ${COMPLIANCE_PCT}%"
+  echo " RESULT   NON-COMPLIANT — $TOTAL_FAIL/$TOTAL controls failing ($COMPLIANCE_PCT%)"
   if [ ${#FAIL_CONTROLS[@]} -gt 0 ]; then
-    echo -e "  ${RED}Controls FAIL: ${FAIL_CONTROLS[*]}${RESET}"
+    echo "          Failed controls: ${FAIL_CONTROLS[*]}"
   fi
 fi
-echo "  Completed: $(date '+%Y-%m-%d %H:%M:%S')"
+echo " INFO     Completed: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
 echo "════════════════════════════════════════════════════════════"
 
 # ── Baseline comparison ───────────────────────────────────────────
 if [ -f "$BASELINE_FILE" ]; then
   echo ""
-  echo "  [ Baseline comparison ]"
   BASELINE_RATE=$(jq '.compliance_rate // 100' "$BASELINE_FILE" 2>/dev/null || echo "100")
-  echo "  Baseline: ${BASELINE_RATE}% | Current: ${COMPLIANCE_PCT}%"
+  echo " BASELINE Comparison"
+  echo "          Baseline : ${BASELINE_RATE}%"
+  echo "          Current  : ${COMPLIANCE_PCT}%"
   if [ "$COMPLIANCE_PCT" -lt "$BASELINE_RATE" ]; then
     DIFF=$((BASELINE_RATE - COMPLIANCE_PCT))
-    echo -e "  ${RED}⚠ REGRESSION: giảm ${DIFF}% so với baseline${RESET}"
+    echo "##[warning] REGRESSION: compliance decreased by ${DIFF}% from baseline"
     REGRESSION_CONTROLS=("${FAIL_CONTROLS[@]}")
   else
-    echo -e "  ${GREEN}✓ Không có regression${RESET}"
+    echo " INFO     No regression detected"
   fi
 fi
 
@@ -117,17 +127,18 @@ fi
 if [ "$OUTPUT_FORMAT" = "json" ]; then
   DOMAINS_JSON=$(IFS=','; echo "${DOMAIN_RESULTS[*]}")
 
-  # Build fail_controls JSON array
   FAIL_JSON="[]"
   if [ ${#FAIL_CONTROLS[@]} -gt 0 ]; then
     FAIL_JSON=$(printf '%s\n' "${FAIL_CONTROLS[@]}" | \
-      python3 -c "import sys,json; print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))" 2>/dev/null || echo "[]")
+      python3 -c "import sys,json; print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))" \
+      2>/dev/null || echo "[]")
   fi
 
   REGRESSION_JSON="[]"
   if [ ${#REGRESSION_CONTROLS[@]} -gt 0 ]; then
     REGRESSION_JSON=$(printf '%s\n' "${REGRESSION_CONTROLS[@]}" | \
-      python3 -c "import sys,json; print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))" 2>/dev/null || echo "[]")
+      python3 -c "import sys,json; print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))" \
+      2>/dev/null || echo "[]")
   fi
 
   STATUS="PASS"; [ "$TOTAL_FAIL" -gt 0 ] && STATUS="FAIL"
@@ -146,11 +157,8 @@ if [ "$OUTPUT_FORMAT" = "json" ]; then
   "domains": [$DOMAINS_JSON]
 }
 EOF
-
   echo ""
-  echo "JSON report: $REPORT_FILE"
-
-  # Lưu fail list để WF4 dùng
+  echo "OK       JSON report: $REPORT_FILE"
   echo "$FAIL_JSON" > /tmp/control_fail_list.json
 fi
 

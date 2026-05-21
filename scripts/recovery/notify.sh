@@ -1,6 +1,7 @@
 #!/bin/bash
 # ================================================================
-# Notify — Tổng hợp kết quả tất cả nhóm và gửi email thật
+# notify.sh
+# Recovery Notification — Send remediation report via email
 # ================================================================
 set -uo pipefail
 
@@ -13,7 +14,6 @@ TRIGGER_REASON="${TRIGGER_REASON:-}"
 GMAIL_USER="${GMAIL_USER:-}"
 GMAIL_PASS="${GMAIL_PASS:-}"
 
-# Kết quả từ các nhóm
 TF_FAILED="${TF_FAILED:-false}"
 ERROR_TYPE="${ERROR_TYPE:-NONE}"
 PRE_FAIL="${PRE_FAIL:-0}"
@@ -35,172 +35,159 @@ WF4_START_TIME="${WF4_START_TIME:-$(date +%s)}"
 LOG_URL="https://github.com/${REPO}/actions/runs/${RUN_ID}"
 ELAPSED=$(( ($(date +%s) - WF4_START_TIME) / 60 ))
 
-# ── Xác định Final Status & Severity ─────────────────────────────
+# ── Determine severity and final status ──────────────────────────
 SEVERITY="INFO"
 FINAL_STATUS="UNKNOWN"
 
 if [ "$G_LOOP_BLOCKED" = "true" ]; then
-  FINAL_STATUS="CRITICAL — Recovery loop blocked, cần can thiệp thủ công ngay"
+  FINAL_STATUS="CRITICAL"
   SEVERITY="CRITICAL"
 elif [ "$G_CRITICAL" = "true" ]; then
-  FINAL_STATUS="CRITICAL — Data integrity issue, cần can thiệp ngay"
+  FINAL_STATUS="CRITICAL"
   SEVERITY="CRITICAL"
 elif [ "$G_FALSE_POSITIVE" = "true" ]; then
-  FINAL_STATUS="BUG — False positive trong check script"
+  FINAL_STATUS="BUG"
   SEVERITY="HIGH"
 elif [ "$TF_FAILED" = "true" ] && [ "${POST_FAIL:-99}" -gt 0 ]; then
-  FINAL_STATUS="CRITICAL — Terraform lỗi + CIS còn FAIL"
+  FINAL_STATUS="CRITICAL"
   SEVERITY="CRITICAL"
 elif [ "$SLA_BREACHED" = "true" ]; then
-  FINAL_STATUS="WARNING — SLA breach"
+  FINAL_STATUS="WARNING"
   SEVERITY="HIGH"
 elif [ "$TF_FAILED" = "true" ] && [ "${POST_FAIL:-0}" -eq 0 ]; then
-  FINAL_STATUS="WARNING — Terraform lỗi, CIS đã OK"
+  FINAL_STATUS="WARNING"
   SEVERITY="MEDIUM"
 elif [ "${POST_FAIL:-0}" -gt 0 ]; then
-  FINAL_STATUS="WARNING — Còn ${POST_FAIL} CIS control FAIL"
+  FINAL_STATUS="WARNING"
   SEVERITY="MEDIUM"
 elif [ "$RECOVERY_STATUS" = "SUCCESS" ]; then
-  FINAL_STATUS="OK — Tất cả đã được xử lý thành công"
+  FINAL_STATUS="OK"
   SEVERITY="INFO"
 fi
 
+# ── Build email subject ───────────────────────────────────────────
+EMAIL_SUBJECT="[$SEVERITY] GCP CIS Security Report — $PROJECT_ID — $(date -u '+%Y-%m-%d %H:%M UTC')"
+
 # ── Build email body ──────────────────────────────────────────────
-EMAIL_SUBJECT="[$SEVERITY] GCP CIS Alert — $PROJECT_ID — $(date '+%Y-%m-%d %H:%M UTC')"
+EMAIL_BODY="GCP SECURITY AUTOMATION REPORT
+════════════════════════════════════════════════════════════
+ Status  : $FINAL_STATUS
+ Severity: $SEVERITY
+════════════════════════════════════════════════════════════
+ Project : $PROJECT_ID
+ Trigger : $TRIGGER
+ Reason  : ${TRIGGER_REASON:-N/A}
+ Time    : $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+ Elapsed : ${ELAPSED} minutes
+ Log URL : $LOG_URL
+────────────────────────────────────────────────────────────
+ CIS COMPLIANCE SUMMARY
+────────────────────────────────────────────────────────────
+ Before  : $PRE_FAIL failed controls
+ After   : ${POST_FAIL:-N/A} failed controls
+ Rate    : ${POST_RATE:-N/A}%
+ Status  : $RECOVERY_STATUS
+────────────────────────────────────────────────────────────
+ VERIFICATION RESULTS
+────────────────────────────────────────────────────────────
+ Layer 1 (Script)  : $([ "${POST_FAIL:-99}" -eq 0 ] && echo PASS || echo FAIL)
+ Layer 2 (GCP API) : $([ "${L2_FAIL:-0}" -eq 0 ] && echo PASS || echo "FAIL ($L2_FAIL issue(s))")
+ Layer 3 (SCC)     : $([ "${L3_FAIL:-0}" -eq 0 ] && echo "PASS" || echo "FAIL ($L3_FAIL finding(s))")"
 
-EMAIL_BODY="================================================================
-GCP CIS BENCHMARK — SECURITY ALERT
-[$FINAL_STATUS]
-================================================================
+# ── Add remediation details ───────────────────────────────────────
+EMAIL_BODY="${EMAIL_BODY}
+────────────────────────────────────────────────────────────
+ REMEDIATION DETAILS
+────────────────────────────────────────────────────────────
+ Group A (gcloud)  : fixed=$([ "$D_FIXED" = "true" ] && echo yes || echo no)
+ Group B (Ansible) : $([ "$F_FIXED" = "true" ] && echo executed || echo skipped)
+ Group D (Infra)   : action=$D_ACTION
+ Group E (Security): fixed=$E_FIXED
+ Group F (Pipeline): fixed=$F_FIXED"
 
-Project   : $PROJECT_ID
-Trigger   : $TRIGGER
-Reason    : ${TRIGGER_REASON:-N/A}
-Time      : $(date '+%Y-%m-%d %H:%M:%S UTC')
-Elapsed   : ${ELAPSED} phút
-Log URL   : $LOG_URL
-
-----------------------------------------------------------------
-CIS COMPLIANCE
-----------------------------------------------------------------
-Before recovery : $PRE_FAIL controls FAIL
-After recovery  : ${POST_FAIL:-N/A} controls FAIL
-Compliance rate : ${POST_RATE:-N/A}%
-Recovery status : $RECOVERY_STATUS
-Layer 2 issues  : ${L2_FAIL:-N/A}
-Layer 3 findings: ${L3_FAIL:-N/A}
-"
-
-# Thêm chi tiết từng nhóm có vấn đề
-if [ "$TF_FAILED" = "true" ]; then
-  EMAIL_BODY="${EMAIL_BODY}
-----------------------------------------------------------------
-NHÓM D — Infrastructure Error
-----------------------------------------------------------------
-Error type : $ERROR_TYPE
-Action     : $D_ACTION
-Auto-fixed : $D_FIXED
-"
-fi
-
+# ── Add critical alerts ───────────────────────────────────────────
 if [ "$G_LOOP_BLOCKED" = "true" ]; then
   EMAIL_BODY="${EMAIL_BODY}
-----------------------------------------------------------------
-NHÓM G — CRITICAL: Recovery Loop Blocked
-----------------------------------------------------------------
-WF4 đã chạy quá nhiều lần mà không giải quyết được.
-Recovery tự động đã bị dừng để tránh vòng lặp vô tận.
+────────────────────────────────────────────────────────────
+ CRITICAL — RECOVERY LOOP BLOCKED
+────────────────────────────────────────────────────────────
+ Automated recovery has been halted after repeated failures.
+ Manual intervention is required.
 
-Hành động cần làm NGAY:
-1. Xem log các lần recovery trước: $LOG_URL
-2. Fix thủ công vấn đề
-3. Reset counter:
-   echo '0' | gsutil cp - gs://tf-state-3a51a40b-8c9e-4126-804/recovery/loop_counter.txt
-4. Trigger lại WF4 manual
-"
+ Required Actions:
+ 1. Review previous recovery logs: $LOG_URL
+ 2. Fix the root cause manually
+ 3. Reset loop counter:
+    echo '0' | gsutil cp - gs://tf-state-3a51a40b-8c9e-4126-804/recovery/loop_counter.txt
+ 4. Re-trigger WF4 manually"
 fi
 
 if [ "$G_FALSE_POSITIVE" = "true" ]; then
   EMAIL_BODY="${EMAIL_BODY}
-----------------------------------------------------------------
-NHÓM G — BUG: False Positive Detected
-----------------------------------------------------------------
-Check script báo PASS nhưng GCP API xác nhận FAIL.
-Kết quả check script không đáng tin.
+────────────────────────────────────────────────────────────
+ BUG — FALSE POSITIVE DETECTED
+────────────────────────────────────────────────────────────
+ Layer 1 (script) reports PASS but Layer 2 (GCP API) reports FAIL.
+ Check script logic may contain a bug.
 
-Hành động:
-1. Review logic trong check script tương ứng
-2. So sánh: script output vs gcloud describe trực tiếp
-3. Fix bug và commit
-"
+ Required Actions:
+ 1. Compare script output vs direct gcloud describe output
+ 2. Fix the check script logic
+ 3. Commit and push the fix"
 fi
 
-if [ "$SLA_BREACHED" = "true" ]; then
-  EMAIL_BODY="${EMAIL_BODY}
-----------------------------------------------------------------
-NHÓM H — SLA Breach
-----------------------------------------------------------------
-Recovery đã chạy ${ELAPSED} phút — vượt SLA.
-HIGH controls SLA: 10 phút
-MED controls SLA : 20 phút
-
-Hành động: Xem log WF4 tìm bottleneck.
-"
-fi
-
-# Action required section
+# ── Add action required section ───────────────────────────────────
 EMAIL_BODY="${EMAIL_BODY}
-----------------------------------------------------------------
-HÀNH ĐỘNG TIẾP THEO
-----------------------------------------------------------------"
+────────────────────────────────────────────────────────────
+ REQUIRED ACTION
+────────────────────────────────────────────────────────────"
 
 case "$SEVERITY" in
   "CRITICAL")
     EMAIL_BODY="${EMAIL_BODY}
-🔴 CẦN XỬ LÝ NGAY (trong 1 giờ)
-- Xem log chi tiết: $LOG_URL
-- Kiểm tra hạ tầng GCP: https://console.cloud.google.com/home/dashboard?project=$PROJECT_ID
-";;
+ Priority: IMMEDIATE (within 1 hour)
+ - Review log: $LOG_URL
+ - GCP Console: https://console.cloud.google.com/home/dashboard?project=$PROJECT_ID"
+    ;;
   "HIGH")
     EMAIL_BODY="${EMAIL_BODY}
-🟠 CẦN XỬ LÝ SỚM (trong 6 giờ)
-- Review log và fix: $LOG_URL
-";;
+ Priority: URGENT (within 6 hours)
+ - Review log: $LOG_URL"
+    ;;
   "MEDIUM")
     EMAIL_BODY="${EMAIL_BODY}
-🟡 CẦN XỬ LÝ (trong 24 giờ)
-- $LOG_URL
-";;
+ Priority: NORMAL (within 24 hours)
+ - Review log: $LOG_URL"
+    ;;
   *)
     EMAIL_BODY="${EMAIL_BODY}
-🟢 Không cần hành động thêm
-";;
+ Priority: NONE — No action required"
+    ;;
 esac
 
 EMAIL_BODY="${EMAIL_BODY}
-================================================================
-GCP CIS Benchmark Automation — project: $PROJECT_ID
-================================================================"
+════════════════════════════════════════════════════════════
+ GCP CIS Security Automation | project=$PROJECT_ID
+════════════════════════════════════════════════════════════"
 
-# ── In ra log ─────────────────────────────────────────────────────
-echo "================================================================"
-echo "  NOTIFY SUMMARY"
-echo "  FINAL_STATUS: $FINAL_STATUS"
-echo "  SEVERITY    : $SEVERITY"
-echo "  ALERT EMAIL : $ALERT_EMAIL"
-echo "================================================================"
+# ── Print to log ──────────────────────────────────────────────────
+echo "════════════════════════════════════════════════════════════"
+echo " NOTIFY   Recovery Report"
+echo " Status : $FINAL_STATUS | Severity: $SEVERITY"
+echo " Email  : $ALERT_EMAIL"
+echo "════════════════════════════════════════════════════════════"
 echo ""
 echo "$EMAIL_BODY"
+echo ""
 
-# ── Lưu email content ra file ────────────────────────────────────
+# ── Save to file ──────────────────────────────────────────────────
 echo "$EMAIL_BODY" > /tmp/notify_email.txt
 
-# ── Gửi email thật qua Gmail SMTP ────────────────────────────────
+# ── Send via Gmail SMTP ───────────────────────────────────────────
 if [ -n "$GMAIL_USER" ] && [ -n "$GMAIL_PASS" ]; then
-  echo ""
-  echo "  Đang gửi email tới $ALERT_EMAIL..."
+  echo "INFO     Sending email to $ALERT_EMAIL..."
 
-  EMAIL_CONTENT="From: GCP Security Bot <$GMAIL_USER>
+  EMAIL_CONTENT="From: GCP Security Automation <$GMAIL_USER>
 To: $ALERT_EMAIL
 Subject: $EMAIL_SUBJECT
 MIME-Version: 1.0
@@ -216,31 +203,27 @@ $EMAIL_BODY"
     --user "$GMAIL_USER:$GMAIL_PASS" \
     --upload-file - \
     2>/dev/null \
-    && echo "  [OK] Email đã gửi tới $ALERT_EMAIL" \
-    || echo "  [WARN] Gửi email thất bại — kiểm tra GMAIL_USER/GMAIL_APP_PASSWORD"
+    && echo "OK       Email delivered to $ALERT_EMAIL" \
+    || echo "##[warning]Email delivery failed — check GMAIL_USER and GMAIL_APP_PASSWORD secrets"
 else
-  echo ""
-  echo "  [WARN] Chưa cấu hình email — thêm GitHub Secrets:"
-  echo "    GMAIL_USER         = your.email@gmail.com"
-  echo "    GMAIL_APP_PASSWORD = xxxx xxxx xxxx xxxx"
-  echo "  Tạo App Password tại: myaccount.google.com/apppasswords"
+  echo "##[warning]Email not configured — add GMAIL_USER and GMAIL_APP_PASSWORD to GitHub Secrets"
+  echo "INFO     Report saved to /tmp/notify_email.txt"
 fi
 
-# ── Export ra GITHUB_ENV và file ──────────────────────────────────
+# ── Export to GITHUB_ENV ──────────────────────────────────────────
 {
   echo "FINAL_STATUS=$FINAL_STATUS"
   echo "SEVERITY=$SEVERITY"
 } >> "${GITHUB_ENV:-/dev/null}" 2>/dev/null || true
 
-# Lưu vào file để WF4 đọc lại
 {
   echo "FINAL_STATUS=$FINAL_STATUS"
   echo "SEVERITY=$SEVERITY"
 } > /tmp/notify_result.txt
 
 echo ""
-echo "================================================================"
-echo "  Notify complete — SEVERITY: $SEVERITY"
-echo "================================================================"
+echo "════════════════════════════════════════════════════════════"
+echo " DONE     Notification complete — severity=$SEVERITY"
+echo "════════════════════════════════════════════════════════════"
 
 [ "$SEVERITY" = "INFO" ] && exit 0 || exit 1
