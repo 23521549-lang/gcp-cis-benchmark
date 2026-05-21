@@ -39,13 +39,13 @@ run_domain_check() {
   echo "$OUTPUT"
 
   local D_PASS D_FAIL
-  D_PASS=$(echo "$OUTPUT" | grep -c "\[PASS\]" || true)
-  D_FAIL=$(echo "$OUTPUT" | grep -c "\[FAIL\]" || true)
+  D_PASS=$(echo "$OUTPUT" | grep -cE "^PASS[[:space:]]+CIS-" || true)
+  D_FAIL=$(echo "$OUTPUT" | grep -cE "^FAIL[[:space:]]+CIS-" || true)
   TOTAL_PASS=$((TOTAL_PASS + D_PASS))
   TOTAL_FAIL=$((TOTAL_FAIL + D_FAIL))
 
   while IFS= read -r line; do
-    if echo "$line" | grep -q "\[FAIL\]"; then
+    if echo "$line" | grep -qE "^FAIL[[:space:]]+CIS-"; then
       CID=$(echo "$line" | grep -oP '\d+\.\d+(\.\d+)?' | head -1 || true)
       [ -n "$CID" ] && FAIL_CONTROLS+=("$CID")
     fi
@@ -162,4 +162,4 @@ EOF
   echo "$FAIL_JSON" > /tmp/control_fail_list.json
 fi
 
-exit $TOTAL_FAIL
+[ "$TOTAL_FAIL" -gt 0 ] && exit 1 || exit 0
